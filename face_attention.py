@@ -269,6 +269,34 @@ def _looking_detections(pose_msg, raw_poses):
     return out
 
 
+def _unblock_inputs(node, max_size=4):
+    """Make a node's inputs non-blocking so a decimated/slow branch can't apply
+    backpressure up a SHARED producer (face_nn.passthrough) and stall the whole
+    graph — the cause of the hang when --age-gender/--emotion are decimated.
+
+    A blocking input queue, once full, stalls the producer; since passthrough
+    fans out to the tracker AND every cropper, one full cropper-image queue
+    freezes the tracker too. Non-blocking makes the slow branch drop frames
+    instead. Accessors drift across depthai releases, so probe defensively.
+    """
+    inputs = []
+    try:                                   # VERIFY getInputs() on this release
+        inputs = list(node.getInputs())
+    except Exception:
+        pass
+    if not inputs:                         # fallback: common named handles
+        for name in ("inputImage", "inputFrame", "input", "inputImgDetections"):
+            h = getattr(node, name, None)
+            if h is not None:
+                inputs.append(h)
+    for inp in inputs:
+        try:
+            inp.setBlocking(False)
+            inp.setMaxSize(max_size)
+        except Exception:
+            pass
+
+
 def _make_face_branch(pipeline, face_detections, face_image, input_size,
                       nn_source, fps, multi_head=True):
     """FrameCropper → ParsingNeuralNetwork → GatherData for a face-crop model.
@@ -284,6 +312,9 @@ def _make_face_branch(pipeline, face_detections, face_image, input_size,
         outputSize=input_size,
         resizeMode=dai.ImageManipConfig.ResizeMode.LETTERBOX,
     ).build(inputImage=face_image)
+    # Drop, don't stall: keeps a decimated branch from back-pressuring the
+    # shared face_nn.passthrough and freezing the tracker. See _unblock_inputs.
+    _unblock_inputs(cropper)
     nn = pipeline.create(ParsingNeuralNetwork).build(
         input=cropper.out, nnSource=nn_source
     )
