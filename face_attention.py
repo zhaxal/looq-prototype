@@ -53,18 +53,17 @@ from depthai_nodes.node import (
 )
 
 # --- Config -----------------------------------------------------------------
-_HERE = Path(__file__).parent
-_MODELS = _HERE / "models"   # populated by download_models.py
+_HERE  = Path(__file__).parent
+_MODELS = _HERE / "models"
 
 
 def _model(slug: str, local_name: str):
-    """Return local NNArchive if present in models/, else the zoo slug string.
-    Prefer local: no network, no API key at runtime."""
+    """Use local archive from models/ if present, else fall back to zoo slug."""
     p = _MODELS / local_name
     return dai.NNArchive(str(p)) if p.exists() else slug
 
 
-POSE_MODEL_SLUG   = "luxonis/head-pose-estimation:60x60"
+POSE_MODEL        = "luxonis/head-pose-estimation:60x60"
 POSE_INPUT        = (60, 60)
 
 # Local model archives for age/gender and emotion (not in zoo; manual download).
@@ -304,7 +303,7 @@ def build_pipeline(pipeline, args):
     cam_w, cam_h = (int(x) for x in args.face_res.split("x"))
     face_model   = _model(f"luxonis/yunet:{args.face_res}",
                           f"yunet-{args.face_res}.rvc2.tar.xz")
-    pose_model   = _model(POSE_MODEL_SLUG, "head-pose-60x60.rvc2.tar.xz")
+    pose_model   = _model(POSE_MODEL, "head-pose-60x60.rvc2.tar.xz")
 
     cam     = pipeline.create(dai.node.Camera).build()  # no socket — proven on RPi4
     cam_out = cam.requestOutput((cam_w, cam_h), dai.ImgFrame.Type.BGR888p, fps=args.fps)

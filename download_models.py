@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""Download zoo models once; saves to models/ so the pipeline runs offline.
+"""Download zoo models on the laptop (where zoo access works), then rsync to Pi.
 
-Usage:
-    DEPTHAI_HUB_API_KEY=your_key python download_models.py
-    # or put the key in .env and just run:
+Run on the laptop:
     python download_models.py
+
+Then copy to Pi (adjust hostname/path):
+    rsync -av models/ pi@raspberrypi.local:~/looq-prototype/models/
+
+face_attention.py uses models/ automatically when present; no network needed on Pi.
 """
 import os
 import shutil
 from pathlib import Path
 
-# Load .env (same logic as face_attention.py so one file covers both)
 _env = Path(__file__).parent / ".env"
 if _env.exists():
     for _line in _env.read_text().splitlines():
@@ -24,9 +26,6 @@ import depthai as dai
 MODELS_DIR = Path(__file__).parent / "models"
 MODELS_DIR.mkdir(exist_ok=True)
 
-# (slug, output filename)
-# Slug format: "namespace/name:variant" — the variant selects the resolution.
-# Platform "RVC2" targets OAK-D-Lite / MyriadX VPU.
 DOWNLOADS = [
     ("luxonis/yunet:320x240",              "yunet-320x240.rvc2.tar.xz"),
     ("luxonis/yunet:640x480",              "yunet-640x480.rvc2.tar.xz"),
@@ -36,21 +35,17 @@ DOWNLOADS = [
 
 def download(slug: str, dest: Path) -> None:
     if dest.exists():
-        print(f"[skip]  {dest.name}  (already present, {dest.stat().st_size // 1024} KB)")
+        print(f"[skip]  {dest.name}  ({dest.stat().st_size // 1024} KB)")
         return
-    print(f"[fetch] {slug} → {dest.name}")
-    # VERIFY: NNModelDescription constructor accepts the full slug as `model`.
-    # `platform` selects the VPU target; RVC2 = OAK-D-Lite / Myriad X.
+    print(f"[fetch] {slug} …")
     desc = dai.NNModelDescription(model=slug, platform="RVC2")
-    tmp = dai.getModelFromZoo(desc, useCached=True, progressFormat="pretty")
+    tmp  = dai.getModelFromZoo(desc, useCached=True, progressFormat="pretty")
     shutil.copy(tmp, dest)
-    print(f"        saved  {dest.stat().st_size // 1024} KB")
+    print(f"        → {dest.name}  ({dest.stat().st_size // 1024} KB)")
 
 
 if __name__ == "__main__":
-    if not os.environ.get("DEPTHAI_HUB_API_KEY"):
-        print("WARNING: DEPTHAI_HUB_API_KEY not set — public models may still work "
-              "but private ones will fail. Set it in .env or the environment.")
     for slug, fname in DOWNLOADS:
         download(slug, MODELS_DIR / fname)
-    print("\nAll done. Run face_attention.py — it will use local archives.")
+    print("\nDone. Rsync to Pi:")
+    print("  rsync -av models/ pi@raspberrypi.local:~/looq-prototype/models/")
