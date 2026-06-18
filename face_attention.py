@@ -216,10 +216,14 @@ def _decimate(pipeline, detections, frames, every_n):
     queue filled and back-pressured the SHARED face_nn.passthrough, starving
     the tracker and freezing the host loop at 0 fps.
 
-    The Script drains both inputs every loop (1:1 with the producer) so it never
-    back-pressures passthrough itself. every_n<=1 → no node, full rate.
-    Returns (detections_out, frame_out); feed detections_out to BOTH the cropper
-    and GatherData's reference so data and reference stay aligned.
+    Both Script inputs are NON-BLOCKING. Passthrough frames are available
+    immediately, but detections lag by the NN's inference latency; with blocking
+    inputs the Script (which reads dets first) stalls at startup while frames
+    pile into its frame queue — once full, the SHARED face_nn.passthrough can no
+    longer send, starving the tracker and producing zero faces. Non-blocking lets
+    stale frames drop so passthrough (and the tracker) never block. every_n<=1 →
+    no node, full rate. Returns (detections_out, frame_out); feed detections_out
+    to BOTH the cropper and GatherData's reference so they stay aligned.
     """
     if every_n <= 1:
         return detections, frames
@@ -236,6 +240,13 @@ while True:
 """)  # VERIFY node.inputs/node.io accessors on this depthai release
     detections.link(script.inputs["dets"])
     frames.link(script.inputs["frame"])
+    # Non-blocking + small queue: drop, don't stall the shared producers.
+    for _name in ("dets", "frame"):
+        try:                               # VERIFY setBlocking/setMaxSize on Script inputs
+            script.inputs[_name].setBlocking(False)
+            script.inputs[_name].setMaxSize(2)
+        except Exception:
+            pass
     return script.outputs["dets_out"], script.outputs["frame_out"]
 
 
