@@ -209,14 +209,13 @@ def _make_face_branch(pipeline, face_detections, face_image, input_size,
     return gathered.out.createOutputQueue(maxSize=2, blocking=False)  # VERIFY kwargs
 
 
-def build_pipeline(args):
+def build_pipeline(pipeline, args):
     _patch_frame_cropper()
-    pipeline = dai.Pipeline()
 
     cam_w, cam_h = (int(x) for x in args.face_res.split("x"))
     face_model   = f"luxonis/yunet:{args.face_res}"
 
-    cam     = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
+    cam     = pipeline.create(dai.node.Camera).build()  # no socket — proven on RPi4
     cam_out = cam.requestOutput((cam_w, cam_h), dai.ImgFrame.Type.BGR888p, fps=args.fps)
 
     # Stage 1: face detection — cam_out has exactly one consumer.
@@ -256,7 +255,7 @@ def build_pipeline(args):
     if args.preview:
         queues["frame"] = face_nn.passthrough.createOutputQueue(maxSize=2, blocking=False)
 
-    return pipeline, queues
+    return queues
 
 
 # --- Preview ----------------------------------------------------------------
@@ -342,141 +341,150 @@ def parse_args():
 
 def main():
     args = parse_args()
-    pipeline, queues = build_pipeline(args)
 
-    active = ["pose"]
-    if args.age_gender: active.append("age/gender")
-    if args.emotion:    active.append("emotion")
-    print(f"Branches: {', '.join(active)}  |  face-res: {args.face_res}  fps: {args.fps}")
+    active_branches = ["pose"]
+    if args.age_gender: active_branches.append("age/gender")
+    if args.emotion:    active_branches.append("emotion")
+    print(f"Branches: {', '.join(active_branches)}  |  face-res: {args.face_res}  fps: {args.fps}")
     print(f"Thresholds: |yaw|<{YAW_LIMIT}  |pitch|<{PITCH_LIMIT} deg  "
           f"debounce: {DEBOUNCE_FRAMES} frames")
     print("Starting pipeline... (Ctrl-C to stop)\n")
 
-    track_states:      dict[int, LookState]         = {}
-    pose_cache:        dict[int, tuple[float, float]]  = {}   # tid → (yaw, pitch)
-    age_gender_cache:  dict[int, tuple[str, int]]      = {}   # tid → (gender, age)
-    emotion_cache:     dict[int, tuple[str, float]]    = {}   # tid → (label, conf)
+    track_states:      dict[int, LookState]            = {}
+    pose_cache:        dict[int, tuple[float, float]]  = {}
+    age_gender_cache:  dict[int, tuple[str, int]]      = {}
+    emotion_cache:     dict[int, tuple[str, float]]    = {}
     last_emotion_time: dict[int, float]                = {}
     looking_ids:       set[int]                        = set()
 
-    pipeline.start()
-    last_log = 0.0
-    try:
-        while pipeline.isRunning():
-            pipeline.processTasks()
+    quit_app = False
+    while not quit_app:
+        try:
+            with dai.Pipeline() as pipeline:
+                queues = build_pipeline(pipeline, args)
+                pipeline.start()
+                print("[camera] pipeline started")
+                last_log = 0.0
 
-            # Tracklets drive every tick; all other queues are opportunistic.
-            track_msg = queues["tracklets"].tryGet()
-            if track_msg is None:
-                time.sleep(0.001)
-                continue
+                while pipeline.isRunning() and not quit_app:
+                    pipeline.processTasks()
 
-            # --- Parse pose data ---
-            raw_poses: list[tuple[tuple, float, float]] = []
-            pose_msg = queues["poses"].tryGet()
-            if pose_msg is not None:
-                for bbox, item in _parse_gathered(pose_msg):
-                    yaw, pitch, _ = extract_pose(item)
-                    raw_poses.append((bbox, yaw, pitch))
+                    # Tracklets drive every tick; all other queues are opportunistic.
+                    track_msg = queues["tracklets"].tryGet()
+                    if track_msg is None:
+                        time.sleep(0.001)
+                        continue
 
-            # --- Parse age/gender data (new tracks only, applied after ID match) ---
-            raw_ag: list[tuple[tuple, object]] = []
-            if "age_gender" in queues:
-                ag_msg = queues["age_gender"].tryGet()
-                if ag_msg is not None:
-                    raw_ag = _parse_gathered(ag_msg)
+                    # --- Parse pose data ---
+                    raw_poses: list[tuple[tuple, float, float]] = []
+                    pose_msg = queues["poses"].tryGet()
+                    if pose_msg is not None:
+                        for bbox, item in _parse_gathered(pose_msg):
+                            yaw, pitch, _ = extract_pose(item)
+                            raw_poses.append((bbox, yaw, pitch))
 
-            # --- Parse emotion data ---
-            raw_emo: list[tuple[tuple, object]] = []
-            if "emotion" in queues:
-                emo_msg = queues["emotion"].tryGet()
-                if emo_msg is not None:
-                    raw_emo = _parse_gathered(emo_msg)
+                    # --- Parse age/gender data (new tracks only, applied after ID match) ---
+                    raw_ag: list[tuple[tuple, object]] = []
+                    if "age_gender" in queues:
+                        ag_msg = queues["age_gender"].tryGet()
+                        if ag_msg is not None:
+                            raw_ag = _parse_gathered(ag_msg)
 
-            # --- Update per-track state ---
-            now = time.time()
-            active_ids: set[int] = set()
+                    # --- Parse emotion data ---
+                    raw_emo: list[tuple[tuple, object]] = []
+                    if "emotion" in queues:
+                        emo_msg = queues["emotion"].tryGet()
+                        if emo_msg is not None:
+                            raw_emo = _parse_gathered(emo_msg)
 
-            for t in track_msg.tracklets:
-                # VERIFY: dai.Tracklet.TrackingStatus enum values
-                if t.status in (dai.Tracklet.TrackingStatus.LOST,
-                                dai.Tracklet.TrackingStatus.REMOVED):
-                    track_states.pop(t.id, None)
-                    pose_cache.pop(t.id, None)
-                    age_gender_cache.pop(t.id, None)
-                    emotion_cache.pop(t.id, None)
-                    last_emotion_time.pop(t.id, None)
-                    looking_ids.discard(t.id)
-                    continue
+                    # --- Update per-track state ---
+                    now = time.time()
+                    active_ids: set[int] = set()
 
-                active_ids.add(t.id)
-                if t.id not in track_states:
-                    track_states[t.id] = LookState()
+                    for t in track_msg.tracklets:
+                        # VERIFY: dai.Tracklet.TrackingStatus enum values
+                        if t.status in (dai.Tracklet.TrackingStatus.LOST,
+                                        dai.Tracklet.TrackingStatus.REMOVED):
+                            track_states.pop(t.id, None)
+                            pose_cache.pop(t.id, None)
+                            age_gender_cache.pop(t.id, None)
+                            emotion_cache.pop(t.id, None)
+                            last_emotion_time.pop(t.id, None)
+                            looking_ids.discard(t.id)
+                            continue
 
-                tb = _bbox_for_tracklet(t)
+                        active_ids.add(t.id)
+                        if t.id not in track_states:
+                            track_states[t.id] = LookState()
 
-                # Refresh pose cache when a fresh match arrives.
-                best_i = _best_match(tb, [(i, p[0]) for i, p in enumerate(raw_poses)])
-                if best_i >= 0:
-                    pose_cache[t.id] = (raw_poses[best_i][1], raw_poses[best_i][2])
+                        tb = _bbox_for_tracklet(t)
 
-                # Debounce using cached pose.
-                yaw, pitch = pose_cache.get(t.id, POSE_UNSEEN)
-                if track_states[t.id].update(is_looking(yaw, pitch)):
-                    looking_ids.add(t.id)
-                else:
-                    looking_ids.discard(t.id)
+                        # Refresh pose cache when a fresh match arrives.
+                        best_i = _best_match(tb, [(i, p[0]) for i, p in enumerate(raw_poses)])
+                        if best_i >= 0:
+                            pose_cache[t.id] = (raw_poses[best_i][1], raw_poses[best_i][2])
 
-                # Age/gender: only cache once per track (no need to re-run).
-                if t.id not in age_gender_cache and raw_ag:
-                    best_i = _best_match(tb, [(i, b) for i, (b, _) in enumerate(raw_ag)])
-                    if best_i >= 0:
-                        age_gender_cache[t.id] = extract_age_gender(raw_ag[best_i][1])
+                        # Debounce using cached pose.
+                        yaw, pitch = pose_cache.get(t.id, POSE_UNSEEN)
+                        if track_states[t.id].update(is_looking(yaw, pitch)):
+                            looking_ids.add(t.id)
+                        else:
+                            looking_ids.discard(t.id)
 
-                # Emotion: update at most every EMOTION_INTERVAL seconds per track.
-                if raw_emo and now - last_emotion_time.get(t.id, 0) >= EMOTION_INTERVAL:
-                    best_i = _best_match(tb, [(i, b) for i, (b, _) in enumerate(raw_emo)])
-                    if best_i >= 0:
-                        emotion_cache[t.id]     = extract_emotion(raw_emo[best_i][1])
-                        last_emotion_time[t.id] = now
+                        # Age/gender: only cache once per track (no need to re-run).
+                        if t.id not in age_gender_cache and raw_ag:
+                            best_i = _best_match(tb, [(i, b) for i, (b, _) in enumerate(raw_ag)])
+                            if best_i >= 0:
+                                age_gender_cache[t.id] = extract_age_gender(raw_ag[best_i][1])
 
-            # Prune state for tracks that silently disappeared.
-            for tid in list(track_states):
-                if tid not in active_ids:
-                    del track_states[tid]
-                    pose_cache.pop(tid, None)
-                    age_gender_cache.pop(tid, None)
-                    emotion_cache.pop(tid, None)
-                    last_emotion_time.pop(tid, None)
-                    looking_ids.discard(tid)
+                        # Emotion: update at most every EMOTION_INTERVAL seconds per track.
+                        if raw_emo and now - last_emotion_time.get(t.id, 0) >= EMOTION_INTERVAL:
+                            best_i = _best_match(tb, [(i, b) for i, (b, _) in enumerate(raw_emo)])
+                            if best_i >= 0:
+                                emotion_cache[t.id]     = extract_emotion(raw_emo[best_i][1])
+                                last_emotion_time[t.id] = now
 
-            # Throttled console output.
-            if now - last_log >= 0.5:
-                last_log = now
-                extras = ""
-                if age_gender_cache:
-                    extras += "  ag=" + str({k: f"{v[0][0]}{v[1]}"
-                                             for k, v in age_gender_cache.items()})
-                if emotion_cache:
-                    extras += "  emo=" + str({k: v[0]
-                                              for k, v in emotion_cache.items()})
-                print(f"Looking: {len(looking_ids):>2}  "
-                      f"tracked: {len(active_ids):>2}  "
-                      f"ids: {sorted(looking_ids)}{extras}")
+                    # Prune state for tracks that silently disappeared.
+                    for tid in list(track_states):
+                        if tid not in active_ids:
+                            del track_states[tid]
+                            pose_cache.pop(tid, None)
+                            age_gender_cache.pop(tid, None)
+                            emotion_cache.pop(tid, None)
+                            last_emotion_time.pop(tid, None)
+                            looking_ids.discard(tid)
 
-            # Optional preview.
-            if args.preview:
-                frame_msg = queues["frame"].tryGet()
-                if frame_msg is not None:
-                    draw_preview(frame_msg, track_msg.tracklets, pose_cache,
-                                 age_gender_cache, emotion_cache, looking_ids)
+                    # Throttled console output.
+                    if now - last_log >= 0.5:
+                        last_log = now
+                        extras = ""
+                        if age_gender_cache:
+                            extras += "  ag=" + str({k: f"{v[0][0]}{v[1]}"
+                                                     for k, v in age_gender_cache.items()})
+                        if emotion_cache:
+                            extras += "  emo=" + str({k: v[0]
+                                                      for k, v in emotion_cache.items()})
+                        print(f"Looking: {len(looking_ids):>2}  "
+                              f"tracked: {len(active_ids):>2}  "
+                              f"ids: {sorted(looking_ids)}{extras}")
 
-    except KeyboardInterrupt:
-        pass
-    finally:
-        if args.preview:
-            cv2.destroyAllWindows()
+                    # Optional preview.
+                    if args.preview:
+                        frame_msg = queues["frame"].tryGet()
+                        if frame_msg is not None:
+                            draw_preview(frame_msg, track_msg.tracklets, pose_cache,
+                                         age_gender_cache, emotion_cache, looking_ids)
 
+                pipeline.stop()
+
+        except KeyboardInterrupt:
+            quit_app = True
+        except Exception as exc:
+            print(f"[main] camera error: {exc}")
+            time.sleep(2.0)
+
+    if args.preview:
+        cv2.destroyAllWindows()
     print("\nPipeline stopped.")
 
 
