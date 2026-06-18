@@ -581,10 +581,12 @@ def main():
 
     quit_app = False
     while not quit_app:
+        started_ok = False
         try:
             with dai.Pipeline() as pipeline:
                 queues = build_pipeline(pipeline, args)
                 pipeline.start()
+                started_ok = True
                 print("[camera] pipeline started")
                 gates = queues.get("_gates", {})
                 last_log = 0.0
@@ -593,12 +595,13 @@ def main():
                 fps_actual  = None
 
                 while pipeline.isRunning() and not quit_app:
-                    pipeline.processTasks()
-
-                    # Tracklets drive every tick; all other queues are opportunistic.
-                    track_msg = queues["tracklets"].tryGet()
+                    # Block on tracklets — the per-frame driver — exactly like the
+                    # proven greenhouse app blocks on its preview queue. v3 has no
+                    # pipeline.processTasks(); host nodes (parsers, GatherData) run
+                    # in their own threads after pipeline.start(). All other queues
+                    # are read opportunistically with tryGet() below.
+                    track_msg = queues["tracklets"].get()
                     if track_msg is None:
-                        time.sleep(0.001)
                         continue
 
                     # --- Parse pose data ---
@@ -769,7 +772,19 @@ def main():
         except KeyboardInterrupt:
             quit_app = True
         except Exception as exc:
+            # Show the real error. A failure BEFORE pipeline.start() is a
+            # build/bring-up bug (wrong API name, bad model archive, drifted
+            # `# VERIFY` accessor) — retrying it just hides the traceback in a
+            # 2s loop, so make it fatal. A failure AFTER start() is treated as a
+            # device disconnect and retried, like the proven greenhouse app.
+            import traceback
             print(f"[main] camera error: {exc}")
+            traceback.print_exc()
+            if not started_ok:
+                print("[main] error occurred during pipeline build/start — "
+                      "not a transient device issue; exiting so the traceback "
+                      "above is visible.")
+                break
             time.sleep(2.0)
 
     if display:

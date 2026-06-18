@@ -36,10 +36,11 @@ GatherData.build(inputData=, inputReference=, cameraFps=)
 # Tracking
 ObjectTracker  # SHORT_TERM_IMAGELESS + UNIQUE_ID strategy
 
-# Host loop
+# Host loop — block on an output queue (NO pipeline.processTasks(); it is not
+# a v3 API. Host nodes/parsers run in their own threads after start()).
 pipeline.start()
 while pipeline.isRunning():
-    pipeline.processTasks()
+    msg = some_queue.get()  # blocking; drives the loop one msg per frame
 
 # Queues
 node.out.createOutputQueue()
