@@ -29,7 +29,9 @@ NOTE: Lines marked `# VERIFY` use API details that can drift between
 depthai / depthai-nodes releases — run once on the OAK and adjust.
 """
 import argparse
+import csv
 import time
+from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -181,6 +183,34 @@ def _patch_frame_cropper():
     FrameCropper.IMG_DETECTIONS_SCRIPT_CONTENT = Template(tmpl)
 
 
+def _decimate(pipeline, detections, every_n):
+    """On-device throttle: forward only every Nth detections message.
+
+    Heavy stage-2 nets (age/gender, emotion) are cached/throttled on the host,
+    but that doesn't stop the VPU from running them every frame. Gating the
+    detections that reach their FrameCropper means the VPU only infers at the
+    rate we actually consume — the real saving when all 4 nets share the chip.
+
+    The forwarded message still carries ALL faces for that frame, so per-frame
+    multi-face gathering is unchanged. every_n<=1 → no node, full rate.
+    Feed the returned output to BOTH the cropper and GatherData's reference so
+    data and reference stay aligned (no empty-reference buildup in GatherData).
+    """
+    if every_n <= 1:
+        return detections
+    script = pipeline.create(dai.node.Script)
+    script.setScript(f"""
+i = 0
+while True:
+    dets = node.inputs['in'].get()
+    i = i + 1
+    if i % {int(every_n)} == 0:
+        node.io['out'].send(dets)
+""")  # VERIFY node.inputs/node.io accessors on this depthai release
+    detections.link(script.inputs["in"])
+    return script.outputs["out"]
+
+
 def _make_face_branch(pipeline, face_detections, face_image, input_size,
                       nn_source, fps, multi_head=True):
     """FrameCropper → ParsingNeuralNetwork → GatherData for a face-crop model.
@@ -243,15 +273,25 @@ def build_pipeline(pipeline, args):
     }
 
     if args.age_gender:
+        # Age/gender only needs one good read per new face → run ~once a second
+        # on device; the host still caches the first result per track ID.
+        ag_every = args.ag_every or max(1, round(args.fps))
+        ag_dets  = _decimate(pipeline, face_nn.out, ag_every)
         queues["age_gender"] = _make_face_branch(
-            pipeline, face_nn.out, face_nn.passthrough, AGE_GENDER_INPUT,
+            pipeline, ag_dets, face_nn.passthrough, AGE_GENDER_INPUT,
             dai.NNArchive(AGE_GENDER_ARCHIVE), args.fps
         )
+        print(f"[opt] age/gender NN gated to every {ag_every} frame(s) on device")
     if args.emotion:
+        # Emotion is the heaviest net (260x260) and host-throttled to
+        # EMOTION_INTERVAL anyway → match that rate on the VPU.
+        emo_every = args.emo_every or max(1, round(args.fps * EMOTION_INTERVAL))
+        emo_dets  = _decimate(pipeline, face_nn.out, emo_every)
         queues["emotion"] = _make_face_branch(
-            pipeline, face_nn.out, face_nn.passthrough, EMOTION_INPUT,
+            pipeline, emo_dets, face_nn.passthrough, EMOTION_INPUT,
             dai.NNArchive(EMOTION_ARCHIVE), args.fps, multi_head=False
         )
+        print(f"[opt] emotion NN gated to every {emo_every} frame(s) on device")
     if args.preview:
         queues["frame"] = face_nn.passthrough.createOutputQueue(maxSize=2, blocking=False)
 
@@ -336,6 +376,12 @@ def parse_args():
                    help="enable age/gender branch (age_gender-62x62.rvc2.tar.xz)")
     p.add_argument("--emotion",    action="store_true",
                    help="enable emotion branch (enet_b2_8_best.rvc2.tar.xz)")
+    p.add_argument("--ag-every",   type=int, default=0,
+                   help="run age/gender NN every Nth frame on device (0=auto ~1s; 1=full rate)")
+    p.add_argument("--emo-every",  type=int, default=0,
+                   help="run emotion NN every Nth frame on device (0=auto ~EMOTION_INTERVAL; 1=full rate)")
+    p.add_argument("--log", nargs="?", const="", metavar="PATH",
+                   help="write CSV session log; omit PATH for auto-named file")
     return p.parse_args()
 
 
@@ -356,6 +402,19 @@ def main():
     emotion_cache:     dict[int, tuple[str, float]]    = {}
     last_emotion_time: dict[int, float]                = {}
     looking_ids:       set[int]                        = set()
+
+    csv_file = csv_writer = None
+    if args.log is not None:
+        _CSV_FIELDS = ["ts", "track_id", "looking",
+                       "yaw", "pitch",
+                       "age", "gender",
+                       "emotion", "emotion_conf",
+                       "looking_total", "tracked_total"]
+        log_path = args.log or f"attention_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        csv_file = open(log_path, "w", newline="", buffering=1)
+        csv_writer = csv.DictWriter(csv_file, fieldnames=_CSV_FIELDS)
+        csv_writer.writeheader()
+        print(f"[log] writing to {log_path}")
 
     quit_app = False
     while not quit_app:
@@ -401,6 +460,11 @@ def main():
                     now = time.time()
                     active_ids: set[int] = set()
 
+                    # Build IoU-match indices once per frame, not per tracklet.
+                    pose_idx = [(i, p[0]) for i, p in enumerate(raw_poses)]
+                    ag_idx   = [(i, b) for i, (b, _) in enumerate(raw_ag)]
+                    emo_idx  = [(i, b) for i, (b, _) in enumerate(raw_emo)]
+
                     for t in track_msg.tracklets:
                         # VERIFY: dai.Tracklet.TrackingStatus enum values
                         if t.status in (dai.Tracklet.TrackingStatus.LOST,
@@ -420,7 +484,7 @@ def main():
                         tb = _bbox_for_tracklet(t)
 
                         # Refresh pose cache when a fresh match arrives.
-                        best_i = _best_match(tb, [(i, p[0]) for i, p in enumerate(raw_poses)])
+                        best_i = _best_match(tb, pose_idx)
                         if best_i >= 0:
                             pose_cache[t.id] = (raw_poses[best_i][1], raw_poses[best_i][2])
 
@@ -433,13 +497,13 @@ def main():
 
                         # Age/gender: only cache once per track (no need to re-run).
                         if t.id not in age_gender_cache and raw_ag:
-                            best_i = _best_match(tb, [(i, b) for i, (b, _) in enumerate(raw_ag)])
+                            best_i = _best_match(tb, ag_idx)
                             if best_i >= 0:
                                 age_gender_cache[t.id] = extract_age_gender(raw_ag[best_i][1])
 
                         # Emotion: update at most every EMOTION_INTERVAL seconds per track.
                         if raw_emo and now - last_emotion_time.get(t.id, 0) >= EMOTION_INTERVAL:
-                            best_i = _best_match(tb, [(i, b) for i, (b, _) in enumerate(raw_emo)])
+                            best_i = _best_match(tb, emo_idx)
                             if best_i >= 0:
                                 emotion_cache[t.id]     = extract_emotion(raw_emo[best_i][1])
                                 last_emotion_time[t.id] = now
@@ -454,7 +518,7 @@ def main():
                             last_emotion_time.pop(tid, None)
                             looking_ids.discard(tid)
 
-                    # Throttled console output.
+                    # Throttled console output + CSV logging.
                     if now - last_log >= 0.5:
                         last_log = now
                         extras = ""
@@ -467,6 +531,29 @@ def main():
                         print(f"Looking: {len(looking_ids):>2}  "
                               f"tracked: {len(active_ids):>2}  "
                               f"ids: {sorted(looking_ids)}{extras}")
+
+                        if csv_writer is not None:
+                            ts = datetime.now().isoformat(timespec="milliseconds")
+                            for t in track_msg.tracklets:
+                                if t.status in (dai.Tracklet.TrackingStatus.LOST,
+                                                dai.Tracklet.TrackingStatus.REMOVED):
+                                    continue
+                                _yaw, _pitch = pose_cache.get(t.id, (None, None))
+                                _gender, _age = age_gender_cache.get(t.id, (None, None))
+                                _emo, _emo_conf = emotion_cache.get(t.id, (None, None))
+                                csv_writer.writerow({
+                                    "ts":            ts,
+                                    "track_id":      t.id,
+                                    "looking":       int(t.id in looking_ids),
+                                    "yaw":           f"{_yaw:.1f}"      if _yaw      is not None else "",
+                                    "pitch":         f"{_pitch:.1f}"    if _pitch    is not None else "",
+                                    "age":           _age               if _age      is not None else "",
+                                    "gender":        _gender            if _gender   is not None else "",
+                                    "emotion":       _emo               if _emo      is not None else "",
+                                    "emotion_conf":  f"{_emo_conf:.2f}" if _emo_conf is not None else "",
+                                    "looking_total": len(looking_ids),
+                                    "tracked_total": len(active_ids),
+                                })
 
                     # Optional preview.
                     if args.preview:
@@ -483,6 +570,8 @@ def main():
             print(f"[main] camera error: {exc}")
             time.sleep(2.0)
 
+    if csv_file:
+        csv_file.close()
     if args.preview:
         cv2.destroyAllWindows()
     print("\nPipeline stopped.")
