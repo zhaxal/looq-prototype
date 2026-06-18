@@ -569,10 +569,21 @@ def _best_match(tb, indexed_bboxes):
 
 
 def _parse_gathered(msg):
-    """Return list of (det_bbox, MessageGroup_item) from a GatheredData message."""
+    """Return list of (det_bbox, MessageGroup_item) from a GatheredData message.
+
+    Defensive against empty frames: when no faces are present GatherData can emit
+    a message with no items or a missing/None reference_data. Reading
+    `.reference_data.detections` blindly then raises AttributeError, which the
+    main loop mistakes for a device disconnect and restarts every 2s — looking
+    like "zero faces then crash". Guard all of it and just return [] instead.
+    """
+    ref = getattr(msg, "reference_data", None)
+    dets = getattr(ref, "detections", None) if ref is not None else None
+    items = getattr(msg, "items", None)
+    if not dets or not items:
+        return []
     out = []
-    for i, item in enumerate(msg.items):        # VERIFY .items accessor
-        dets = msg.reference_data.detections
+    for i, item in enumerate(items):            # VERIFY .items accessor
         if i >= len(dets):
             break
         det = dets[i]
