@@ -30,9 +30,19 @@ depthai / depthai-nodes releases — run once on the OAK and adjust.
 """
 import argparse
 import csv
+import os
 import time
 from datetime import datetime
 from pathlib import Path
+
+# Load DEPTHAI_HUB_API_KEY from .env if present (needed for zoo model downloads).
+_env_file = Path(__file__).parent / ".env"
+if _env_file.exists():
+    for _line in _env_file.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _, _v = _line.partition("=")
+            os.environ.setdefault(_k.strip(), _v.strip())
 
 import cv2
 import depthai as dai
@@ -44,11 +54,20 @@ from depthai_nodes.node import (
 
 # --- Config -----------------------------------------------------------------
 _HERE = Path(__file__).parent
+_MODELS = _HERE / "models"   # populated by download_models.py
 
-POSE_MODEL        = "luxonis/head-pose-estimation:60x60"
+
+def _model(slug: str, local_name: str):
+    """Return local NNArchive if present in models/, else the zoo slug string.
+    Prefer local: no network, no API key at runtime."""
+    p = _MODELS / local_name
+    return dai.NNArchive(str(p)) if p.exists() else slug
+
+
+POSE_MODEL_SLUG   = "luxonis/head-pose-estimation:60x60"
 POSE_INPUT        = (60, 60)
 
-# Local model archives (downloaded from HubAI, placed next to this script).
+# Local model archives for age/gender and emotion (not in zoo; manual download).
 AGE_GENDER_ARCHIVE = _HERE / "age_gender-62x62.rvc2.tar.xz"
 EMOTION_ARCHIVE    = _HERE / "enet_b2_8_best.rvc2.tar.xz"
 AGE_GENDER_INPUT  = (62, 62)
@@ -283,7 +302,9 @@ def build_pipeline(pipeline, args):
     _patch_frame_cropper()
 
     cam_w, cam_h = (int(x) for x in args.face_res.split("x"))
-    face_model   = f"luxonis/yunet:{args.face_res}"
+    face_model   = _model(f"luxonis/yunet:{args.face_res}",
+                          f"yunet-{args.face_res}.rvc2.tar.xz")
+    pose_model   = _model(POSE_MODEL_SLUG, "head-pose-60x60.rvc2.tar.xz")
 
     cam     = pipeline.create(dai.node.Camera).build()  # no socket — proven on RPi4
     cam_out = cam.requestOutput((cam_w, cam_h), dai.ImgFrame.Type.BGR888p, fps=args.fps)
@@ -308,7 +329,7 @@ def build_pipeline(pipeline, args):
     queues = {
         "tracklets": tracker.out.createOutputQueue(maxSize=2, blocking=False),
         "poses": _make_face_branch(
-            pipeline, face_nn.out, face_nn.passthrough, POSE_INPUT, POSE_MODEL, args.fps
+            pipeline, face_nn.out, face_nn.passthrough, POSE_INPUT, pose_model, args.fps
         ),
     }
 
