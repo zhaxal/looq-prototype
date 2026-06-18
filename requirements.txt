@@ -1,0 +1,8 @@
+# DepthAI v3 + host-side parser nodes. Pin majors; let patches float.
+depthai>=3.0.0
+depthai-nodes>=0.2.0
+
+# Use the headless build on the Raspberry Pi (no GUI deps).
+# On your laptop (for --preview) swap this for plain opencv-python.
+opencv-python-headless>=4.9.0
+numpy>=1.24.0
