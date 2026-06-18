@@ -335,6 +335,91 @@ def draw_preview(frame_msg, tracklets, pose_cache, age_gender_cache,
     cv2.waitKey(1)
 
 
+# --- Live terminal dashboard (--tui) ----------------------------------------
+
+class LiveDisplay:
+    """In-place ANSI dashboard for SSH testing. No extra dependencies."""
+
+    _HIDE = "\033[?25l"   # hide cursor
+    _SHOW = "\033[?25h"   # restore cursor
+    _HOME = "\033[H"
+    _CLEAR = "\033[2J"
+    _BOLD = "\033[1m"
+    _DIM  = "\033[2m"
+    _RST  = "\033[0m"
+    _GRN  = "\033[32m"
+    _RED  = "\033[31m"
+    _CYN  = "\033[36m"
+    _YLW  = "\033[33m"
+    _W    = 64
+
+    def __init__(self, face_res, fps):
+        self.face_res = face_res
+        self.fps = fps
+        print(self._HIDE, end="", flush=True)
+
+    def close(self):
+        print(self._SHOW, end="", flush=True)
+
+    @staticmethod
+    def _c(text, *codes):
+        return "\033[" + ";".join(codes) + "m" + text + "\033[0m"
+
+    def _rule(self, char="─"):
+        return char * self._W
+
+    def update(self, looking_ids, active_ids, tracklets,
+               pose_cache, age_gender_cache, emotion_cache, fps_actual=None):
+        fps_s = f"{fps_actual:.1f}fps" if fps_actual else f"{self.fps}fps"
+        title = f" ATTENTION  {self.face_res} @ {fps_s}"
+        lines = [
+            self._CLEAR + self._HOME,
+            self._c(title.ljust(self._W), "1", "7"),  # bold + reverse
+            self._rule(),
+        ]
+
+        n_look  = len(looking_ids)
+        n_total = len(active_ids)
+        bar_on  = "█" * n_look
+        bar_off = "░" * max(0, n_total - n_look)
+        count_s = self._c(str(n_look), "1", "32")
+        lines.append(f"  LOOKING  {count_s} / {n_total}   "
+                     + self._c(bar_on, "32") + self._c(bar_off, "2"))
+        lines.append(self._rule())
+
+        # Header
+        lines.append(self._c(
+            f"  {'ID':>3}  {'LOOK':^4}  {'YAW':>6}  {'PITCH':>6}  {'A/G':>6}  EMOTION",
+            "2"))
+        lines.append(self._rule("╌"))
+
+        active_tracklets = [t for t in tracklets
+                            if t.status not in (dai.Tracklet.TrackingStatus.LOST,
+                                                dai.Tracklet.TrackingStatus.REMOVED)]
+        if not active_tracklets:
+            lines.append(self._c("  no faces detected", "2"))
+        for t in active_tracklets:
+            looking = t.id in looking_ids
+            look_s  = self._c(" YES", "1", "32") if looking else self._c("  no", "31")
+
+            yp       = pose_cache.get(t.id)
+            yaw_s    = f"{yp[0]:+5.0f}°" if yp else "     ?"
+            pitch_s  = f"{yp[1]:+5.0f}°" if yp else "     ?"
+
+            ag       = age_gender_cache.get(t.id)
+            ag_s     = f"{ag[0][0]}{ag[1]:>3}" if ag else "     "
+
+            em       = emotion_cache.get(t.id)
+            emo_s    = f"{em[0]} {em[1]:.0%}" if em else ""
+
+            row = f"  {t.id:>3}  {look_s}  {yaw_s}  {pitch_s}  {ag_s}  {emo_s}"
+            lines.append(row)
+
+        lines.append(self._rule())
+        lines.append(self._c("  q / Ctrl-C to stop", "2"))
+        print("\n".join(lines), end="", flush=True)
+
+
 # --- Helpers ----------------------------------------------------------------
 
 def _bbox_for_tracklet(t):
@@ -382,6 +467,8 @@ def parse_args():
                    help="run emotion NN every Nth frame on device (0=auto ~EMOTION_INTERVAL; 1=full rate)")
     p.add_argument("--log", nargs="?", const="", metavar="PATH",
                    help="write CSV session log; omit PATH for auto-named file")
+    p.add_argument("--tui", action="store_true",
+                   help="live in-place terminal dashboard (good for SSH testing)")
     return p.parse_args()
 
 
@@ -402,6 +489,8 @@ def main():
     emotion_cache:     dict[int, tuple[str, float]]    = {}
     last_emotion_time: dict[int, float]                = {}
     looking_ids:       set[int]                        = set()
+
+    display = LiveDisplay(args.face_res, args.fps) if args.tui else None
 
     csv_file = csv_writer = None
     if args.log is not None:
@@ -424,6 +513,8 @@ def main():
                 pipeline.start()
                 print("[camera] pipeline started")
                 last_log = 0.0
+                frame_count = 0
+                fps_actual  = None
 
                 while pipeline.isRunning() and not quit_app:
                     pipeline.processTasks()
@@ -518,19 +609,30 @@ def main():
                             last_emotion_time.pop(tid, None)
                             looking_ids.discard(tid)
 
-                    # Throttled console output + CSV logging.
+                    frame_count += 1
+
+                    # Throttled output + CSV logging.
                     if now - last_log >= 0.5:
-                        last_log = now
-                        extras = ""
-                        if age_gender_cache:
-                            extras += "  ag=" + str({k: f"{v[0][0]}{v[1]}"
-                                                     for k, v in age_gender_cache.items()})
-                        if emotion_cache:
-                            extras += "  emo=" + str({k: v[0]
-                                                      for k, v in emotion_cache.items()})
-                        print(f"Looking: {len(looking_ids):>2}  "
-                              f"tracked: {len(active_ids):>2}  "
-                              f"ids: {sorted(looking_ids)}{extras}")
+                        elapsed     = now - last_log if last_log else 0.5
+                        fps_actual  = frame_count / elapsed
+                        frame_count = 0
+                        last_log    = now
+
+                        if display is not None:
+                            display.update(looking_ids, active_ids, track_msg.tracklets,
+                                           pose_cache, age_gender_cache, emotion_cache,
+                                           fps_actual)
+                        else:
+                            extras = ""
+                            if age_gender_cache:
+                                extras += "  ag=" + str({k: f"{v[0][0]}{v[1]}"
+                                                         for k, v in age_gender_cache.items()})
+                            if emotion_cache:
+                                extras += "  emo=" + str({k: v[0]
+                                                          for k, v in emotion_cache.items()})
+                            print(f"Looking: {len(looking_ids):>2}  "
+                                  f"tracked: {len(active_ids):>2}  "
+                                  f"ids: {sorted(looking_ids)}{extras}")
 
                         if csv_writer is not None:
                             ts = datetime.now().isoformat(timespec="milliseconds")
@@ -570,6 +672,8 @@ def main():
             print(f"[main] camera error: {exc}")
             time.sleep(2.0)
 
+    if display:
+        display.close()
     if csv_file:
         csv_file.close()
     if args.preview:
