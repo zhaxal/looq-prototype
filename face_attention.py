@@ -211,6 +211,46 @@ while True:
     return script.outputs["out"]
 
 
+def _looking_gate(pipeline):
+    """Host-fed detection gate for the busy-street case.
+
+    The host already decides who is 'looking' (head-pose thresholds). Instead of
+    cropping every face for the heavy nets, it sends ONLY the looking faces'
+    detections into this Script, which forwards them to the heavy-net cropper.
+    On a crowded street where most faces aren't looking, this is the big VPU
+    saving: age/gender + emotion run on the few who looked, not the crowd.
+
+    Uses the same host→Script input-queue pattern as the greenhouse `trigger`.
+    Returns (output_for_cropper, host_input_queue).
+    """
+    script = pipeline.create(dai.node.Script)
+    script.setScript("""
+while True:
+    d = node.inputs['dets'].get()
+    node.io['out'].send(d)
+""")  # VERIFY node.inputs/node.io accessors on this depthai release
+    in_q = script.inputs["dets"].createInputQueue()   # VERIFY createInputQueue
+    return script.outputs["out"], in_q
+
+
+def _looking_detections(pose_msg, raw_poses):
+    """Build an ImgDetections of only the looking faces, stamped with the
+    source frame's timestamp so the device cropper matches it to the right
+    buffered frame. raw_poses[i] aligns with reference detection i (same order
+    out of GatherData)."""
+    ref = pose_msg.reference_data                       # VERIFY accessor
+    src = list(ref.detections)
+    out = dai.ImgDetections()
+    out.detections = [src[i] for i, (_, yaw, pitch) in enumerate(raw_poses)
+                      if i < len(src) and is_looking(yaw, pitch)]
+    try:                                                # VERIFY ts/seq round-trip
+        out.setTimestamp(ref.getTimestamp())
+        out.setSequenceNum(ref.getSequenceNum())
+    except Exception:
+        pass
+    return out
+
+
 def _make_face_branch(pipeline, face_detections, face_image, input_size,
                       nn_source, fps, multi_head=True):
     """FrameCropper → ParsingNeuralNetwork → GatherData for a face-crop model.
@@ -272,26 +312,43 @@ def build_pipeline(pipeline, args):
         ),
     }
 
+    # When --looking-gate is set, heavy branches are fed by a host-controlled
+    # gate (only looking faces); otherwise they fall back to on-device frame
+    # decimation (the safe default for first device bring-up).
+    gate_queues = {}   # name -> (host_input_queue, every_n)
+
     if args.age_gender:
-        # Age/gender only needs one good read per new face → run ~once a second
-        # on device; the host still caches the first result per track ID.
+        # Age/gender only needs one good read per new face → run ~once a second.
+        # The host still caches the first result per track ID.
         ag_every = args.ag_every or max(1, round(args.fps))
-        ag_dets  = _decimate(pipeline, face_nn.out, ag_every)
+        if args.looking_gate:
+            ag_dets, ag_in = _looking_gate(pipeline)
+            gate_queues["age_gender"] = (ag_in, ag_every)
+            print(f"[opt] age/gender gated to LOOKING faces, every {ag_every} frame(s)")
+        else:
+            ag_dets = _decimate(pipeline, face_nn.out, ag_every)
+            print(f"[opt] age/gender NN gated to every {ag_every} frame(s) on device")
         queues["age_gender"] = _make_face_branch(
             pipeline, ag_dets, face_nn.passthrough, AGE_GENDER_INPUT,
             dai.NNArchive(AGE_GENDER_ARCHIVE), args.fps
         )
-        print(f"[opt] age/gender NN gated to every {ag_every} frame(s) on device")
     if args.emotion:
         # Emotion is the heaviest net (260x260) and host-throttled to
         # EMOTION_INTERVAL anyway → match that rate on the VPU.
         emo_every = args.emo_every or max(1, round(args.fps * EMOTION_INTERVAL))
-        emo_dets  = _decimate(pipeline, face_nn.out, emo_every)
+        if args.looking_gate:
+            emo_dets, emo_in = _looking_gate(pipeline)
+            gate_queues["emotion"] = (emo_in, emo_every)
+            print(f"[opt] emotion gated to LOOKING faces, every {emo_every} frame(s)")
+        else:
+            emo_dets = _decimate(pipeline, face_nn.out, emo_every)
+            print(f"[opt] emotion NN gated to every {emo_every} frame(s) on device")
         queues["emotion"] = _make_face_branch(
             pipeline, emo_dets, face_nn.passthrough, EMOTION_INPUT,
             dai.NNArchive(EMOTION_ARCHIVE), args.fps, multi_head=False
         )
-        print(f"[opt] emotion NN gated to every {emo_every} frame(s) on device")
+
+    queues["_gates"] = gate_queues
     if args.preview:
         queues["frame"] = face_nn.passthrough.createOutputQueue(maxSize=2, blocking=False)
 
@@ -369,7 +426,8 @@ class LiveDisplay:
         return char * self._W
 
     def update(self, looking_ids, active_ids, tracklets,
-               pose_cache, age_gender_cache, emotion_cache, fps_actual=None):
+               pose_cache, age_gender_cache, emotion_cache, fps_actual=None,
+               dwell=None):
         fps_s = f"{fps_actual:.1f}fps" if fps_actual else f"{self.fps}fps"
         title = f" ATTENTION  {self.face_res} @ {fps_s}"
         lines = [
@@ -389,7 +447,7 @@ class LiveDisplay:
 
         # Header
         lines.append(self._c(
-            f"  {'ID':>3}  {'LOOK':^4}  {'YAW':>6}  {'PITCH':>6}  {'A/G':>6}  EMOTION",
+            f"  {'ID':>3}  {'LOOK':^4}  {'DWELL':>6}  {'YAW':>6}  {'PITCH':>6}  {'A/G':>6}  EMOTION",
             "2"))
         lines.append(self._rule("╌"))
 
@@ -402,6 +460,9 @@ class LiveDisplay:
             looking = t.id in looking_ids
             look_s  = self._c(" YES", "1", "32") if looking else self._c("  no", "31")
 
+            secs     = (dwell or {}).get(t.id, 0.0)
+            dwell_s  = f"{secs:5.1f}s"
+
             yp       = pose_cache.get(t.id)
             yaw_s    = f"{yp[0]:+5.0f}°" if yp else "     ?"
             pitch_s  = f"{yp[1]:+5.0f}°" if yp else "     ?"
@@ -412,7 +473,7 @@ class LiveDisplay:
             em       = emotion_cache.get(t.id)
             emo_s    = f"{em[0]} {em[1]:.0%}" if em else ""
 
-            row = f"  {t.id:>3}  {look_s}  {yaw_s}  {pitch_s}  {ag_s}  {emo_s}"
+            row = f"  {t.id:>3}  {look_s}  {dwell_s}  {yaw_s}  {pitch_s}  {ag_s}  {emo_s}"
             lines.append(row)
 
         lines.append(self._rule())
@@ -424,6 +485,14 @@ class LiveDisplay:
 
 def _bbox_for_tracklet(t):
     return (t.roi.x, t.roi.y, t.roi.x + t.roi.width, t.roi.y + t.roi.height)
+
+
+def _total_dwell(tid, now, look_accum, look_since):
+    """Total seconds tid has been (committed) looking, including any live streak."""
+    total = look_accum.get(tid, 0.0)
+    if tid in look_since:
+        total += now - look_since[tid]
+    return total
 
 
 def _best_match(tb, indexed_bboxes):
@@ -469,6 +538,9 @@ def parse_args():
                    help="write CSV session log; omit PATH for auto-named file")
     p.add_argument("--tui", action="store_true",
                    help="live in-place terminal dashboard (good for SSH testing)")
+    p.add_argument("--looking-gate", action="store_true",
+                   help="run age/gender + emotion only on faces confirmed looking "
+                        "(scales to crowded scenes; needs --age-gender/--emotion)")
     return p.parse_args()
 
 
@@ -489,12 +561,14 @@ def main():
     emotion_cache:     dict[int, tuple[str, float]]    = {}
     last_emotion_time: dict[int, float]                = {}
     looking_ids:       set[int]                        = set()
+    look_accum:        dict[int, float]                = {}   # tid → cumulative looking seconds
+    look_since:        dict[int, float]                = {}   # tid → start of current looking streak
 
     display = LiveDisplay(args.face_res, args.fps) if args.tui else None
 
     csv_file = csv_writer = None
     if args.log is not None:
-        _CSV_FIELDS = ["ts", "track_id", "looking",
+        _CSV_FIELDS = ["ts", "track_id", "looking", "look_seconds",
                        "yaw", "pitch",
                        "age", "gender",
                        "emotion", "emotion_conf",
@@ -512,8 +586,10 @@ def main():
                 queues = build_pipeline(pipeline, args)
                 pipeline.start()
                 print("[camera] pipeline started")
+                gates = queues.get("_gates", {})
                 last_log = 0.0
                 frame_count = 0
+                gate_tick   = 0
                 fps_actual  = None
 
                 while pipeline.isRunning() and not quit_app:
@@ -532,6 +608,16 @@ def main():
                         for bbox, item in _parse_gathered(pose_msg):
                             yaw, pitch, _ = extract_pose(item)
                             raw_poses.append((bbox, yaw, pitch))
+
+                    # --- Feed the looking-gate (heavy nets only see looking faces) ---
+                    if gates and pose_msg is not None:
+                        look_dets = None
+                        for _name, (in_q, every_n) in gates.items():
+                            if gate_tick % every_n == 0:
+                                if look_dets is None:
+                                    look_dets = _looking_detections(pose_msg, raw_poses)
+                                in_q.send(look_dets)
+                        gate_tick += 1
 
                     # --- Parse age/gender data (new tracks only, applied after ID match) ---
                     raw_ag: list[tuple[tuple, object]] = []
@@ -566,6 +652,8 @@ def main():
                             emotion_cache.pop(t.id, None)
                             last_emotion_time.pop(t.id, None)
                             looking_ids.discard(t.id)
+                            look_accum.pop(t.id, None)
+                            look_since.pop(t.id, None)
                             continue
 
                         active_ids.add(t.id)
@@ -579,12 +667,19 @@ def main():
                         if best_i >= 0:
                             pose_cache[t.id] = (raw_poses[best_i][1], raw_poses[best_i][2])
 
-                        # Debounce using cached pose.
+                        # Debounce using cached pose; accumulate dwell time on the
+                        # committed state (a streak's seconds land in look_accum
+                        # when it ends; the live streak is added on read).
                         yaw, pitch = pose_cache.get(t.id, POSE_UNSEEN)
                         if track_states[t.id].update(is_looking(yaw, pitch)):
                             looking_ids.add(t.id)
+                            if t.id not in look_since:
+                                look_since[t.id] = now
                         else:
                             looking_ids.discard(t.id)
+                            if t.id in look_since:
+                                look_accum[t.id] = (look_accum.get(t.id, 0.0)
+                                                    + now - look_since.pop(t.id))
 
                         # Age/gender: only cache once per track (no need to re-run).
                         if t.id not in age_gender_cache and raw_ag:
@@ -608,6 +703,8 @@ def main():
                             emotion_cache.pop(tid, None)
                             last_emotion_time.pop(tid, None)
                             looking_ids.discard(tid)
+                            look_accum.pop(tid, None)
+                            look_since.pop(tid, None)
 
                     frame_count += 1
 
@@ -619,9 +716,11 @@ def main():
                         last_log    = now
 
                         if display is not None:
+                            dwell = {tid: _total_dwell(tid, now, look_accum, look_since)
+                                     for tid in active_ids}
                             display.update(looking_ids, active_ids, track_msg.tracklets,
                                            pose_cache, age_gender_cache, emotion_cache,
-                                           fps_actual)
+                                           fps_actual, dwell)
                         else:
                             extras = ""
                             if age_gender_cache:
@@ -647,6 +746,7 @@ def main():
                                     "ts":            ts,
                                     "track_id":      t.id,
                                     "looking":       int(t.id in looking_ids),
+                                    "look_seconds":  f"{_total_dwell(t.id, now, look_accum, look_since):.1f}",
                                     "yaw":           f"{_yaw:.1f}"      if _yaw      is not None else "",
                                     "pitch":         f"{_pitch:.1f}"    if _pitch    is not None else "",
                                     "age":           _age               if _age      is not None else "",
