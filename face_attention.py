@@ -201,32 +201,42 @@ def _patch_frame_cropper():
     FrameCropper.IMG_DETECTIONS_SCRIPT_CONTENT = Template(tmpl)
 
 
-def _decimate(pipeline, detections, every_n):
-    """On-device throttle: forward only every Nth detections message.
+def _decimate(pipeline, detections, frames, every_n):
+    """On-device throttle: forward only every Nth (detections, frame) PAIR.
 
     Heavy stage-2 nets (age/gender, emotion) are cached/throttled on the host,
-    but that doesn't stop the VPU from running them every frame. Gating the
-    detections that reach their FrameCropper means the VPU only infers at the
-    rate we actually consume — the real saving when all 4 nets share the chip.
+    but that doesn't stop the VPU from running them every frame. Gating what
+    reaches their FrameCropper means the VPU only infers at the rate we actually
+    consume — the real saving when all 4 nets share the chip.
 
-    The forwarded message still carries ALL faces for that frame, so per-frame
-    multi-face gathering is unchanged. every_n<=1 → no node, full rate.
-    Feed the returned output to BOTH the cropper and GatherData's reference so
-    data and reference stay aligned (no empty-reference buildup in GatherData).
+    Critically, we gate the DETECTIONS and the IMAGE together in one Script so
+    the cropper always receives a matched 1:1 pair — the same shape as the
+    full-rate path that works. Gating detections alone (the old version) left
+    the cropper pulling full-rate images against 1-in-N detections; its image
+    queue filled and back-pressured the SHARED face_nn.passthrough, starving
+    the tracker and freezing the host loop at 0 fps.
+
+    The Script drains both inputs every loop (1:1 with the producer) so it never
+    back-pressures passthrough itself. every_n<=1 → no node, full rate.
+    Returns (detections_out, frame_out); feed detections_out to BOTH the cropper
+    and GatherData's reference so data and reference stay aligned.
     """
     if every_n <= 1:
-        return detections
+        return detections, frames
     script = pipeline.create(dai.node.Script)
     script.setScript(f"""
 i = 0
 while True:
-    dets = node.inputs['in'].get()
+    dets = node.inputs['dets'].get()
+    frame = node.inputs['frame'].get()
     i = i + 1
     if i % {int(every_n)} == 0:
-        node.io['out'].send(dets)
+        node.io['dets_out'].send(dets)
+        node.io['frame_out'].send(frame)
 """)  # VERIFY node.inputs/node.io accessors on this depthai release
-    detections.link(script.inputs["in"])
-    return script.outputs["out"]
+    detections.link(script.inputs["dets"])
+    frames.link(script.inputs["frame"])
+    return script.outputs["dets_out"], script.outputs["frame_out"]
 
 
 def _looking_gate(pipeline):
@@ -374,13 +384,14 @@ def build_pipeline(pipeline, args):
         ag_every = args.ag_every or max(1, round(args.fps))
         if args.looking_gate:
             ag_dets, ag_in = _looking_gate(pipeline)
+            ag_img = face_nn.passthrough
             gate_queues["age_gender"] = (ag_in, ag_every)
             print(f"[opt] age/gender gated to LOOKING faces, every {ag_every} frame(s)")
         else:
-            ag_dets = _decimate(pipeline, face_nn.out, ag_every)
+            ag_dets, ag_img = _decimate(pipeline, face_nn.out, face_nn.passthrough, ag_every)
             print(f"[opt] age/gender NN gated to every {ag_every} frame(s) on device")
         queues["age_gender"] = _make_face_branch(
-            pipeline, ag_dets, face_nn.passthrough, AGE_GENDER_INPUT,
+            pipeline, ag_dets, ag_img, AGE_GENDER_INPUT,
             dai.NNArchive(AGE_GENDER_ARCHIVE), args.fps
         )
     if args.emotion:
@@ -389,13 +400,14 @@ def build_pipeline(pipeline, args):
         emo_every = args.emo_every or max(1, round(args.fps * EMOTION_INTERVAL))
         if args.looking_gate:
             emo_dets, emo_in = _looking_gate(pipeline)
+            emo_img = face_nn.passthrough
             gate_queues["emotion"] = (emo_in, emo_every)
             print(f"[opt] emotion gated to LOOKING faces, every {emo_every} frame(s)")
         else:
-            emo_dets = _decimate(pipeline, face_nn.out, emo_every)
+            emo_dets, emo_img = _decimate(pipeline, face_nn.out, face_nn.passthrough, emo_every)
             print(f"[opt] emotion NN gated to every {emo_every} frame(s) on device")
         queues["emotion"] = _make_face_branch(
-            pipeline, emo_dets, face_nn.passthrough, EMOTION_INPUT,
+            pipeline, emo_dets, emo_img, EMOTION_INPUT,
             dai.NNArchive(EMOTION_ARCHIVE), args.fps, multi_head=False
         )
 
