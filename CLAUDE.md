@@ -17,7 +17,7 @@ DepthAI v3. Do not use v2 patterns.
 - Emotion throttled periodically (heavy net, Pi 4 budget)
 
 ## Confirmed v3 Model Zoo Slugs
-- Face detect: `luxonis/yunet:640x480` (also 320x240, 640x360, 960x720, 1280x960)
+- Face detect: `luxonis/yunet:640x480` (confirmed zoo slugs: 320x240, 640x360, 640x480, 960x720)
 - Head pose: `luxonis/head-pose-estimation:60x60`
 - Age/gender: classic OpenVINO `age-gender-recognition-retail` (~62x62) — needs conversion via HubAI/ModelConverter, not yet a confirmed v3 zoo slug
 - Emotion: classic OpenVINO `emotions-recognition-retail` (64x64, 5 classes) — same status

@@ -25,20 +25,23 @@ from pathlib import Path
 
 from attention.config import (
     load_dotenv,
-    DEFAULT_FPS, FACE_RESOLUTIONS, EMOTION_INTERVAL,
-    YAW_LIMIT, PITCH_LIMIT, DEBOUNCE_FRAMES, POSE_UNSEEN,
+    DEFAULT_FPS, FACE_RESOLUTIONS, AGE_GENDER_INTERVAL, EMOTION_INTERVAL,
+    YAW_LIMIT, PITCH_LIMIT, DEBOUNCE_SECS, POSE_UNSEEN,
 )
 from attention import pipeline as att_pipeline
 from attention.display import LiveDisplay, draw_preview
 from attention.processing import (
     LookState, is_looking,
     extract_pose, extract_age_gender, extract_emotion,
-    parse_gathered, tracklet_bbox, best_match, total_dwell,
+    parse_gathered, tracklet_bbox, tracklet_too_small, best_match, total_dwell,
+    verify_enums, probe_tracklet, probe_gathered,
 )
 
 load_dotenv()
 
 import depthai as dai  # noqa: E402 — must come after load_dotenv sets hub API key
+
+verify_enums(dai)
 
 
 # --- CLI ---------------------------------------------------------------------
@@ -48,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--preview",      action="store_true",
                    help="annotated OpenCV window (laptop only)")
     p.add_argument("--fps",          type=float, default=DEFAULT_FPS)
-    p.add_argument("--face-res",     default="640x480", choices=FACE_RESOLUTIONS,
+    p.add_argument("--face-res",     default="960x720", choices=FACE_RESOLUTIONS,
                    help="YuNet input resolution; 320x240 recommended on Pi")
     p.add_argument("--age-gender",   action="store_true",
                    help="enable age/gender branch (models/age_gender/ required)")
@@ -70,7 +73,7 @@ def parse_args() -> argparse.Namespace:
 # --- Session log -------------------------------------------------------------
 
 _CSV_FIELDS = [
-    "ts", "track_id", "looking", "look_seconds",
+    "ts", "track_id", "event", "looking", "look_seconds",
     "yaw", "pitch",
     "age", "gender",
     "emotion", "emotion_conf",
@@ -85,10 +88,16 @@ def run(args: argparse.Namespace) -> None:
     pose_cache:        dict[int, tuple[float, float]] = {}
     age_gender_cache:  dict[int, tuple[str, int]]     = {}
     emotion_cache:     dict[int, tuple[str, float]]   = {}
+    last_age_gender_time: dict[int, float]             = {}
     last_emotion_time: dict[int, float]               = {}
     looking_ids:       set[int]                       = set()
     look_accum:        dict[int, float]               = {}
     look_since:        dict[int, float]               = {}
+
+    session_ids:   set[int]         = set()
+    session_dwell: dict[int, float] = {}
+    peak_looking:  int              = 0
+    session_start: float            = 0.0
 
     display = LiveDisplay(args.face_res, args.fps) if args.tui else None
 
@@ -101,14 +110,40 @@ def run(args: argparse.Namespace) -> None:
         print(f"[log] writing to {log_path}")
 
     def _purge(tid: int) -> None:
+        session_ids.add(tid)
+        session_dwell[tid] = (session_dwell.get(tid, 0.0)
+                              + total_dwell(tid, time.time(), look_accum, look_since))
         track_states.pop(tid, None)
         pose_cache.pop(tid, None)
         age_gender_cache.pop(tid, None)
         emotion_cache.pop(tid, None)
+        last_age_gender_time.pop(tid, None)
         last_emotion_time.pop(tid, None)
         looking_ids.discard(tid)
         look_accum.pop(tid, None)
         look_since.pop(tid, None)
+
+    def _write_row(tid: int, event: str, now: float) -> None:
+        if csv_writer is None:
+            return
+        _yaw, _pitch    = pose_cache.get(tid, (None, None))
+        _gender, _age   = age_gender_cache.get(tid, (None, None))
+        _emo, _emo_conf = emotion_cache.get(tid, (None, None))
+        csv_writer.writerow({
+            "ts":            datetime.now().isoformat(timespec="milliseconds"),
+            "track_id":      tid,
+            "event":         event,
+            "looking":       int(tid in looking_ids),
+            "look_seconds":  f"{total_dwell(tid, now, look_accum, look_since):.1f}",
+            "yaw":           f"{_yaw:.1f}"      if _yaw      is not None else "",
+            "pitch":         f"{_pitch:.1f}"    if _pitch    is not None else "",
+            "age":           _age               if _age      is not None else "",
+            "gender":        _gender            if _gender   is not None else "",
+            "emotion":       _emo               if _emo      is not None else "",
+            "emotion_conf":  f"{_emo_conf:.2f}" if _emo_conf is not None else "",
+            "looking_total": len(looking_ids),
+            "tracked_total": len(active_ids),
+        })
 
     quit_app = False
     while not quit_app:
@@ -118,12 +153,16 @@ def run(args: argparse.Namespace) -> None:
                 queues     = att_pipeline.build(pipeline, args)
                 pipeline.start()
                 started_ok = True
+                if session_start == 0.0:
+                    session_start = time.time()
                 print("[camera] pipeline started")
 
-                gates       = queues.get("_gates", {})
-                last_log    = 0.0
-                frame_count = 0
-                fps_actual  = None
+                gates            = queues.get("_gates", {})
+                last_log         = 0.0
+                frame_count      = 0
+                fps_actual       = None
+                _tracklet_probed = False
+                _pose_probed     = False
 
                 while pipeline.isRunning() and not quit_app:
                     # Block on tracklets — the per-frame driver.
@@ -137,6 +176,9 @@ def run(args: argparse.Namespace) -> None:
                     raw_poses: list[tuple[tuple, float, float]] = []
                     pose_msg = queues["poses"].tryGet()
                     if pose_msg is not None:
+                        if not _pose_probed:
+                            probe_gathered(pose_msg)
+                            _pose_probed = True
                         for bbox, item in parse_gathered(pose_msg):
                             yaw, pitch, _ = extract_pose(item)
                             raw_poses.append((bbox, yaw, pitch))
@@ -176,8 +218,16 @@ def run(args: argparse.Namespace) -> None:
                     for t in track_msg.tracklets:
                         if t.status in (dai.Tracklet.TrackingStatus.LOST,    # VERIFY enum
                                         dai.Tracklet.TrackingStatus.REMOVED):
+                            _write_row(t.id, t.status.name.lower(), now)
                             _purge(t.id)
                             continue
+
+                        if tracklet_too_small(t):
+                            continue
+
+                        if not _tracklet_probed:
+                            probe_tracklet(t)
+                            _tracklet_probed = True
 
                         active_ids.add(t.id)
                         if t.id not in track_states:
@@ -190,7 +240,7 @@ def run(args: argparse.Namespace) -> None:
                             pose_cache[t.id] = (raw_poses[best_i][1], raw_poses[best_i][2])
 
                         yaw, pitch = pose_cache.get(t.id, POSE_UNSEEN)
-                        if track_states[t.id].update(is_looking(yaw, pitch)):
+                        if track_states[t.id].update(is_looking(yaw, pitch), now):
                             looking_ids.add(t.id)
                             if t.id not in look_since:
                                 look_since[t.id] = now
@@ -200,10 +250,11 @@ def run(args: argparse.Namespace) -> None:
                                 look_accum[t.id] = (look_accum.get(t.id, 0.0)
                                                     + now - look_since.pop(t.id))
 
-                        if t.id not in age_gender_cache and raw_ag:
+                        if raw_ag and now - last_age_gender_time.get(t.id, 0) >= AGE_GENDER_INTERVAL:
                             best_i = best_match(tb, ag_idx)
                             if best_i >= 0:
-                                age_gender_cache[t.id] = extract_age_gender(raw_ag[best_i][1])
+                                age_gender_cache[t.id]     = extract_age_gender(raw_ag[best_i][1])
+                                last_age_gender_time[t.id] = now
 
                         if raw_emo and now - last_emotion_time.get(t.id, 0) >= EMOTION_INTERVAL:
                             best_i = best_match(tb, emo_idx)
@@ -215,6 +266,7 @@ def run(args: argparse.Namespace) -> None:
                         if tid not in active_ids:
                             _purge(tid)
 
+                    peak_looking = max(peak_looking, len(looking_ids))
                     frame_count += 1
 
                     # --- Throttled output (0.5 s) ---
@@ -246,29 +298,10 @@ def run(args: argparse.Namespace) -> None:
                                   f"tracked: {len(active_ids):>2}  "
                                   f"ids: {sorted(looking_ids)}{extras}")
 
-                        if csv_writer is not None:
-                            ts = datetime.now().isoformat(timespec="milliseconds")
-                            for t in track_msg.tracklets:
-                                if t.status in (dai.Tracklet.TrackingStatus.LOST,
+                        for t in track_msg.tracklets:
+                            if t.status not in (dai.Tracklet.TrackingStatus.LOST,
                                                 dai.Tracklet.TrackingStatus.REMOVED):
-                                    continue
-                                _yaw, _pitch       = pose_cache.get(t.id, (None, None))
-                                _gender, _age      = age_gender_cache.get(t.id, (None, None))
-                                _emo, _emo_conf    = emotion_cache.get(t.id, (None, None))
-                                csv_writer.writerow({
-                                    "ts":            ts,
-                                    "track_id":      t.id,
-                                    "looking":       int(t.id in looking_ids),
-                                    "look_seconds":  f"{total_dwell(t.id, now, look_accum, look_since):.1f}",
-                                    "yaw":           f"{_yaw:.1f}"      if _yaw      is not None else "",
-                                    "pitch":         f"{_pitch:.1f}"    if _pitch    is not None else "",
-                                    "age":           _age               if _age      is not None else "",
-                                    "gender":        _gender            if _gender   is not None else "",
-                                    "emotion":       _emo               if _emo      is not None else "",
-                                    "emotion_conf":  f"{_emo_conf:.2f}" if _emo_conf is not None else "",
-                                    "looking_total": len(looking_ids),
-                                    "tracked_total": len(active_ids),
-                                })
+                                _write_row(t.id, "tick", now)
 
                     # --- Optional preview ---
                     if args.preview:
@@ -299,7 +332,38 @@ def run(args: argparse.Namespace) -> None:
     if args.preview:
         import cv2
         cv2.destroyAllWindows()
-    print("\nPipeline stopped.")
+
+    # Flush any faces still active at exit (never received LOST/REMOVED).
+    _end = time.time()
+    for tid in list(track_states):
+        session_ids.add(tid)
+        session_dwell[tid] = (session_dwell.get(tid, 0.0)
+                              + total_dwell(tid, _end, look_accum, look_since))
+
+    _print_summary(session_ids, session_dwell, peak_looking,
+                   _end - session_start if session_start else 0.0)
+
+
+def _print_summary(session_ids: set, session_dwell: dict,
+                   peak_looking: int, duration: float) -> None:
+    n_total  = len(session_ids)
+    n_looked = sum(1 for d in session_dwell.values() if d > 0)
+    avg_dwell = (sum(session_dwell.values()) / n_looked) if n_looked else 0.0
+    hrs, rem  = divmod(int(duration), 3600)
+    mins, sec = divmod(rem, 60)
+    W = 47
+    print(f"\n{'═' * W}")
+    print(f"  SESSION SUMMARY")
+    print(f"{'═' * W}")
+    print(f"  Duration      : {hrs:02d}:{mins:02d}:{sec:02d}")
+    print(f"  Unique faces  : {n_total}")
+    if n_total:
+        print(f"  Looked at you : {n_looked}  ({n_looked / n_total:.0%})")
+    else:
+        print(f"  Looked at you : 0")
+    print(f"  Peak looking  : {peak_looking}")
+    print(f"  Avg dwell     : {avg_dwell:.1f}s  (among faces that looked)")
+    print(f"{'═' * W}")
 
 
 def main() -> None:
@@ -313,7 +377,7 @@ def main() -> None:
     print(f"Branches: {', '.join(active)}  |  "
           f"face-res: {args.face_res}  fps: {args.fps}  source: {source}")
     print(f"Thresholds: |yaw|<{YAW_LIMIT}  |pitch|<{PITCH_LIMIT} deg  "
-          f"debounce: {DEBOUNCE_FRAMES} frames")
+          f"debounce: {DEBOUNCE_SECS}s")
     print("Starting pipeline... (Ctrl-C to stop)\n")
 
     run(args)

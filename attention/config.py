@@ -37,16 +37,19 @@ EMOTION_INPUT    = (260, 260)
 
 # --- Pipeline ----------------------------------------------------------------
 
-FACE_RESOLUTIONS = ("320x240", "640x360", "640x480")
+FACE_RESOLUTIONS = ("320x240", "640x360", "640x480", "960x720")
 
 DEFAULT_FPS     = 12
-FACE_CONFIDENCE = 0.6
+FACE_CONFIDENCE = 0.80
+MIN_FACE_AREA   = 0.003  # normalized bbox area; filters distant blobs (≈ 55×42 px at 640×480)
 YAW_LIMIT       = 20.0
 PITCH_LIMIT     = 15.0
-DEBOUNCE_FRAMES = 3
+DEBOUNCE_SECS = 0.20   # commit looking/not-looking after this many seconds stable
 IOU_THRESHOLD   = 0.2
 POSE_UNSEEN     = (90.0, 90.0)   # sentinel used when no pose is cached yet
 
+# Minimum seconds between per-track age/gender updates (re-runs to correct bad initial estimates).
+AGE_GENDER_INTERVAL = 2.0
 # Minimum seconds between per-track emotion updates (heavy net on Pi 4 budget).
 EMOTION_INTERVAL = 2.0
 

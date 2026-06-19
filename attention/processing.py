@@ -7,22 +7,20 @@ from . import config
 # --- Per-track debounce ------------------------------------------------------
 
 class LookState:
-    """Requires DEBOUNCE_FRAMES consecutive identical readings before committing."""
+    """Commits looking/not-looking only after the reading is stable for DEBOUNCE_SECS."""
 
-    __slots__ = ("committed", "tentative", "count")
+    __slots__ = ("committed", "tentative", "since")
 
     def __init__(self) -> None:
         self.committed = False
         self.tentative = False
-        self.count     = 0
+        self.since     = 0.0
 
-    def update(self, looking: bool) -> bool:
-        if looking == self.tentative:
-            self.count += 1
-        else:
+    def update(self, looking: bool, now: float) -> bool:
+        if looking != self.tentative:
             self.tentative = looking
-            self.count     = 1
-        if self.count >= config.DEBOUNCE_FRAMES:
+            self.since     = now
+        elif now - self.since >= config.DEBOUNCE_SECS:
             self.committed = self.tentative
         return self.committed
 
@@ -48,6 +46,12 @@ def is_looking(yaw: float, pitch: float) -> bool:
 
 def tracklet_bbox(t) -> tuple:
     return (t.roi.x, t.roi.y, t.roi.x + t.roi.width, t.roi.y + t.roi.height)  # VERIFY .roi
+
+
+def tracklet_too_small(t) -> bool:
+    """True when the tracklet bbox area is below MIN_FACE_AREA (normalized)."""
+    return t.roi.width * t.roi.height < config.MIN_FACE_AREA
+
 
 
 def best_match(query: tuple, candidates: list[tuple[int, tuple]]) -> int:
@@ -128,3 +132,53 @@ def parse_gathered(msg) -> list[tuple[tuple, object]]:
         for i, det in enumerate(dets)
         if i < len(items)                            # VERIFY .items accessor
     ]
+
+
+# --- Startup self-test -------------------------------------------------------
+
+def verify_enums(dai) -> None:
+    """Check that enum values used in the pipeline actually exist.
+    Prints a [VERIFY] warning for each missing name; does not raise.
+    """
+    checks = [
+        (dai.Tracklet.TrackingStatus, "LOST"),
+        (dai.Tracklet.TrackingStatus, "REMOVED"),
+        (dai.TrackerType,             "SHORT_TERM_IMAGELESS"),
+        (dai.TrackerIdAssignmentPolicy, "UNIQUE_ID"),
+    ]
+    for obj, name in checks:
+        if not hasattr(obj, name):
+            available = [x for x in dir(obj) if not x.startswith("_")]
+            print(f"[VERIFY] {type(obj).__name__}.{name} not found — "
+                  f"available: {available}")
+
+
+def probe_tracklet(t) -> None:
+    """On the first live tracklet, verify the .roi accessor.
+    Prints a [VERIFY] warning if the name has drifted; does not raise.
+    """
+    if not hasattr(t, "roi"):
+        available = [a for a in dir(t) if not a.startswith("_")]
+        print(f"[VERIFY] Tracklet has no .roi — available: {available}")
+        return
+    for attr in ("x", "y", "width", "height"):
+        if not hasattr(t.roi, attr):
+            available = [a for a in dir(t.roi) if not a.startswith("_")]
+            print(f"[VERIFY] Tracklet.roi has no .{attr} — available: {available}")
+
+
+def probe_gathered(msg) -> None:
+    """On the first non-empty GatheredData message, verify reference_data and items.
+    Prints a [VERIFY] warning if names have drifted; does not raise.
+    """
+    ref = getattr(msg, "reference_data", None)
+    if ref is None:
+        available = [a for a in dir(msg) if not a.startswith("_")]
+        print(f"[VERIFY] GatheredData has no .reference_data — available: {available}")
+    else:
+        if not hasattr(ref, "detections"):
+            available = [a for a in dir(ref) if not a.startswith("_")]
+            print(f"[VERIFY] reference_data has no .detections — available: {available}")
+    if not hasattr(msg, "items"):
+        available = [a for a in dir(msg) if not a.startswith("_")]
+        print(f"[VERIFY] GatheredData has no .items — available: {available}")

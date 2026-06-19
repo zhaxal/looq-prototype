@@ -171,10 +171,7 @@ def build(pipeline, args) -> dict:
     face_nn = pipeline.create(ParsingNeuralNetwork).build(
         input=cam_out, nnSource=face_model            # VERIFY arg names
     )
-    try:
-        face_nn.setConfidenceThreshold(config.FACE_CONFIDENCE)  # VERIFY available on parser
-    except AttributeError:
-        pass
+    face_nn.getParser(0).setConfidenceThreshold(config.FACE_CONFIDENCE)
 
     tracker = pipeline.create(dai.node.ObjectTracker)
     tracker.setTrackerType(dai.TrackerType.SHORT_TERM_IMAGELESS)          # VERIFY enum
