@@ -46,10 +46,26 @@ while pipeline.isRunning():
 node.out.createOutputQueue()
 ```
 
+## Project Layout
+```
+attention/          Python package
+  config.py         constants, model paths, load_dotenv()
+  processing.py     LookState, geometry, NN parsers
+  pipeline.py       DAI pipeline construction (build, decimate, etc.)
+  display.py        LiveDisplay (TUI) + draw_preview (OpenCV)
+main.py             CLI entry point  →  python main.py [flags]
+scripts/
+  download_models.py  fetch zoo models on laptop, then rsync to Pi
+models/
+  age_gender/       config.json + superblob (HubAI output)
+  emotion/          config.json + superblob
+  *.rvc2.tar.xz     zoo archives (yunet, head-pose)
+```
+
 ## Build Phases
 - [x] Phase 1-3: camera → YuNet → ObjectTracker → FrameCropper → head pose → prints id/yaw/pitch/LOOKING
-- [ ] Phase 4: debounced counter + deduplicate by track ID; optional `--preview` overlay
-- [ ] Phase 5: add age/gender (cache per track ID) then emotion (throttled); both need model conversion
+- [x] Phase 4: debounced counter + deduplicate by track ID; `--preview` overlay; `--tui` dashboard; CSV log
+- [x] Phase 5: age/gender (cache per track ID) + emotion (throttled); `--looking-gate`; `--test-video`
 
 ## Known Risks / VERIFY Markers
 Code has `# VERIFY` comments on accessor/enum names that may drift across depthai-nodes releases:

@@ -1,3 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# DepthAI cache
 .cache/
 .depthai_cached_models/
+
+# Secrets
 .env
+
+# Session logs
+attention_*.csv
+
+# Editor / OS
+.DS_Store
+Thumbs.db
