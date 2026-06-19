@@ -60,38 +60,6 @@ def unblock_inputs(node, max_size: int = 4) -> None:
             pass
 
 
-def decimate(pipeline, detections, frames, every_n: int):
-    """Forward only every Nth (detections, frame) pair to throttle heavy branches.
-
-    Gates both streams together in one Script so the downstream cropper always
-    receives matched pairs. Inputs are non-blocking to prevent back-pressure on
-    the shared face_nn.passthrough. every_n <= 1 returns the originals unchanged.
-    Returns (detections_out, frame_out).
-    """
-    if every_n <= 1:
-        return detections, frames
-    script = pipeline.create(dai.node.Script)
-    script.setScript(f"""
-i = 0
-while True:
-    dets  = node.inputs['dets'].get()
-    frame = node.inputs['frame'].get()
-    i = i + 1
-    if i % {int(every_n)} == 0:
-        node.io['dets_out'].send(dets)
-        node.io['frame_out'].send(frame)
-""")  # VERIFY node.inputs / node.io accessors on this depthai release
-    detections.link(script.inputs["dets"])
-    frames.link(script.inputs["frame"])
-    for name in ("dets", "frame"):
-        try:                                         # VERIFY setBlocking / setMaxSize on Script inputs
-            script.inputs[name].setBlocking(False)
-            script.inputs[name].setMaxSize(2)
-        except Exception:
-            pass
-    return script.outputs["dets_out"], script.outputs["frame_out"]
-
-
 def looking_gate(pipeline):
     """Host-controlled detection gate.
 
@@ -226,30 +194,28 @@ def build(pipeline, args) -> dict:
     gate_queues: dict = {}
 
     if args.age_gender:
-        ag_every = args.ag_every or max(1, round(args.fps))
         if args.looking_gate:
             ag_dets, ag_in = looking_gate(pipeline)
-            gate_queues["age_gender"] = (ag_in, ag_every)
+            gate_queues["age_gender"] = ag_in
             ag_img = face_nn.passthrough
-            print(f"[opt] age/gender gated to LOOKING faces, every {ag_every} frame(s)")
+            print("[opt] age/gender gated to LOOKING faces")
         else:
-            ag_dets, ag_img = decimate(pipeline, face_nn.out, face_nn.passthrough, ag_every)
-            print(f"[opt] age/gender NN gated to every {ag_every} frame(s) on device")
+            ag_dets, ag_img = face_nn.out, face_nn.passthrough
+            print("[opt] age/gender running at full rate")
         queues["age_gender"] = make_face_branch(
             pipeline, ag_dets, ag_img, config.AGE_GENDER_INPUT,
             dai.NNArchive(str(config.AGE_GENDER_ARCHIVE)), args.fps,
         )
 
     if args.emotion:
-        emo_every = args.emo_every or max(1, round(args.fps * config.EMOTION_INTERVAL))
         if args.looking_gate:
             emo_dets, emo_in = looking_gate(pipeline)
-            gate_queues["emotion"] = (emo_in, emo_every)
+            gate_queues["emotion"] = emo_in
             emo_img = face_nn.passthrough
-            print(f"[opt] emotion gated to LOOKING faces, every {emo_every} frame(s)")
+            print("[opt] emotion gated to LOOKING faces")
         else:
-            emo_dets, emo_img = decimate(pipeline, face_nn.out, face_nn.passthrough, emo_every)
-            print(f"[opt] emotion NN gated to every {emo_every} frame(s) on device")
+            emo_dets, emo_img = face_nn.out, face_nn.passthrough
+            print("[opt] emotion running at full rate")
         queues["emotion"] = make_face_branch(
             pipeline, emo_dets, emo_img, config.EMOTION_INPUT,
             dai.NNArchive(str(config.EMOTION_ARCHIVE)), args.fps,

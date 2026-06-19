@@ -54,12 +54,6 @@ def parse_args() -> argparse.Namespace:
                    help="enable age/gender branch (models/age_gender/ required)")
     p.add_argument("--emotion",      action="store_true",
                    help="enable emotion branch (models/emotion/ required)")
-    p.add_argument("--ag-every",     type=int, default=0,
-                   help="run age/gender every Nth frame on device "
-                        "(0 = auto ~1 s; 1 = full rate)")
-    p.add_argument("--emo-every",    type=int, default=0,
-                   help="run emotion every Nth frame on device "
-                        "(0 = auto ~EMOTION_INTERVAL; 1 = full rate)")
     p.add_argument("--log",          nargs="?", const="", metavar="PATH",
                    help="write CSV session log; omit PATH for an auto-named file")
     p.add_argument("--tui",          action="store_true",
@@ -129,7 +123,6 @@ def run(args: argparse.Namespace) -> None:
                 gates       = queues.get("_gates", {})
                 last_log    = 0.0
                 frame_count = 0
-                gate_tick   = 0
                 fps_actual  = None
 
                 while pipeline.isRunning() and not quit_app:
@@ -151,14 +144,12 @@ def run(args: argparse.Namespace) -> None:
                     # --- Feed looking-gate for heavy branches ---
                     if gates and pose_msg is not None:
                         look_dets = None
-                        for _name, (in_q, every_n) in gates.items():
-                            if gate_tick % every_n == 0:
-                                if look_dets is None:
-                                    look_dets = att_pipeline.looking_detections(
-                                        pose_msg, raw_poses
-                                    )
-                                in_q.send(look_dets)
-                        gate_tick += 1
+                        for _name, in_q in gates.items():
+                            if look_dets is None:
+                                look_dets = att_pipeline.looking_detections(
+                                    pose_msg, raw_poses
+                                )
+                            in_q.send(look_dets)
 
                     # --- Age / gender ---
                     raw_ag: list[tuple[tuple, object]] = []
