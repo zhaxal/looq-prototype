@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Ad Attention
+Comment=Count who looks at the advertisement
+# scripts/setup_pi.sh rewrites Exec with the real absolute path on install.
+Exec=/home/pi/looq-prototype/run.sh
+Icon=camera-video
+Terminal=false
+Categories=Utility;

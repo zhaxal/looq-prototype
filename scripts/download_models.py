@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
-"""Download zoo models on the laptop (where zoo access works), then rsync to Pi.
+"""Download the two zoo models this app needs (YuNet + head-pose) into models/.
 
-Run on the laptop:
+The Pi setup script restores these from git, so you normally don't need this. Use it
+to refresh the archives or fetch a face resolution that isn't committed:
+
     python scripts/download_models.py
-
-Then copy to Pi (adjust hostname / path):
-    rsync -av models/ pi@raspberrypi.local:~/looq-prototype/models/
-
-main.py uses models/ automatically when present; no network needed on Pi.
 """
 import shutil
 import sys
@@ -44,5 +41,4 @@ if __name__ == "__main__":
     MODELS_DIR.mkdir(exist_ok=True)
     for slug, fname in DOWNLOADS:
         download(slug, MODELS_DIR / fname)
-    print("\nDone. Rsync to Pi:")
-    print("  rsync -av models/ pi@raspberrypi.local:~/looq-prototype/models/")
+    print("\nDone.")

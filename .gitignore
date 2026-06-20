@@ -17,6 +17,9 @@ venv/
 # Session logs
 attention_*.csv
 
+# Per-device user settings (offsets are calibrated on-site)
+settings.json
+
 # Editor / OS
 .DS_Store
 Thumbs.db

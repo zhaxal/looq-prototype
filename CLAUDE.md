@@ -1,82 +1,66 @@
-# looq-prototype — Attention Counter
+# looq-prototype — Ad Attention
 
-OAK-D-Lite app: count how many people are looking at the camera, plus age/gender/emotion per person.
+Portable device that measures how many people look at an advertisement and for how
+long. OAK-D-Lite + Raspberry Pi 4 with a **touchscreen**, operated entirely from a
+fullscreen touch GUI (no terminal).
 
-## Hardware & Deploy Target
-- Camera: OAK-D-Lite (RVC2 VPU)
-- Deploy: Raspberry Pi 4, headless (`opencv-python-headless`)
-- Power: powered USB hub or Y-cable (Pi USB alone is unreliable)
-- Dev: laptop with OAK confirmed working in oakviewer
+## Hardware & Deploy
+- Camera: OAK-D-Lite (RVC2 VPU), sitting **beside** the ad on a fixed side.
+- Host: Raspberry Pi 4 with touchscreen (desktop session — the GUI is Tkinter).
+- Power: powered USB hub or Y-cable (Pi USB alone is unreliable).
+- Provision: `bash scripts/setup_pi.sh` (apt deps, OAK udev rule, venv, models, icon).
 
 ## SDK
-DepthAI v3. Do not use v2 patterns.
+DepthAI **v3**. Do not use v2 patterns.
 
 ## Key Design Decisions
-- "Looking" = **head pose** (yaw/pitch thresholds), NOT full gaze estimation — simpler and more robust
-- Age/gender cached per track ID (re-run only on new faces)
-- Emotion throttled periodically (heavy net, Pi 4 budget)
+- "Looking" = **head pose** (yaw/pitch), NOT gaze estimation.
+- Camera is beside the ad, so "looking at the ad" is an **angular offset** from the
+  camera axis. The **Calibrate** button measures that offset empirically (and resolves
+  its sign) — see `Settings.yaw_offset` / `is_looking_at_ad()`.
+- Metrics only: **unique viewer count + dwell time**. No age/gender/emotion.
+- Settings persist to `settings.json` (offsets, tolerances, face_res, fps, log).
 
-## Confirmed v3 Model Zoo Slugs
-- Face detect: `luxonis/yunet:640x480` (confirmed zoo slugs: 320x240, 640x360, 640x480, 960x720)
-- Head pose: `luxonis/head-pose-estimation:60x60`
-- Age/gender: classic OpenVINO `age-gender-recognition-retail` (~62x62) — needs conversion via HubAI/ModelConverter, not yet a confirmed v3 zoo slug
-- Emotion: classic OpenVINO `emotions-recognition-retail` (64x64, 5 classes) — same status
+## Architecture
+GUI on the main thread; the DepthAI pipeline + host matching loop run in a worker
+thread (`attention/engine.py`) publishing a thread-safe `SharedState` the GUI polls.
+Frames render via Pillow `ImageTk`, so the Pi keeps `opencv-python-headless`.
 
-## v3 Wiring Idiom
-```python
-# Stage-1 detection
-ParsingNeuralNetwork.build(input=, nnSource=SLUG)
-
-# Per-face crop
-FrameCropper.fromImgDetections(...).build(inputImage=)
-
-# Sync stage-2 output to detections
-GatherData.build(inputData=, inputReference=, cameraFps=)
-
-# Tracking
-ObjectTracker  # SHORT_TERM_IMAGELESS + UNIQUE_ID strategy
-
-# Host loop — block on an output queue (NO pipeline.processTasks(); it is not
-# a v3 API. Host nodes/parsers run in their own threads after start()).
-pipeline.start()
-while pipeline.isRunning():
-    msg = some_queue.get()  # blocking; drives the loop one msg per frame
-
-# Queues
-node.out.createOutputQueue()
+```
+Camera(BGR888p 320x240) → PNN[YuNet] → ObjectTracker(SHORT_TERM_IMAGELESS+UNIQUE_ID)
+                                      └→ FrameCropper[60x60] → PNN[head-pose] → GatherData → poses
 ```
 
 ## Project Layout
 ```
-attention/          Python package
-  config.py         constants, model paths, load_dotenv()
-  processing.py     LookState, geometry, NN parsers
-  pipeline.py       DAI pipeline construction (build, decimate, etc.)
-  display.py        LiveDisplay (TUI) + draw_preview (OpenCV)
-main.py             CLI entry point  →  python main.py [flags]
+app.py                  touch-GUI entry point  →  python app.py
+main.py                 headless/SSH CLI (--calibrate, --log, offset flags)
+attention/
+  config.py             constants + Settings (settings.json) + load_dotenv()
+  processing.py         LookState, geometry, is_looking_at_ad(), pose parser, VERIFY probes
+  pipeline.py           DepthAI v3 pipeline (single head-pose branch)
+  engine.py             worker thread, host loop, SharedState, calibrate, CSV log
+  gui.py                Tkinter fullscreen touch UI
 scripts/
-  download_models.py  fetch zoo models on laptop, then rsync to Pi
-models/
-  age_gender/       config.json + superblob (HubAI output)
-  emotion/          config.json + superblob
-  *.rvc2.tar.xz     zoo archives (yunet, head-pose)
+  setup_pi.sh           one-shot Pi provisioning
+  download_models.py    fetch YuNet + head-pose from the zoo (models restored from git otherwise)
+run.sh, adwatch.desktop tap-to-launch on the Pi desktop
+models/                 yunet-{320x240,640x480} + head-pose-60x60 archives
 ```
 
-## Build Phases
-- [x] Phase 1-3: camera → YuNet → ObjectTracker → FrameCropper → head pose → prints id/yaw/pitch/LOOKING
-- [x] Phase 4: debounced counter + deduplicate by track ID; `--preview` overlay; `--tui` dashboard; CSV log
-- [x] Phase 5: age/gender (cache per track ID) + emotion (throttled); `--looking-gate`; `--test-video`
+## Confirmed v3 Model Zoo Slugs
+- Face detect: `luxonis/yunet:<res>` (320x240 default; also 640x360/640x480/960x720)
+- Head pose: `luxonis/head-pose-estimation:60x60`
 
 ## Known Risks / VERIFY Markers
-Code has `# VERIFY` comments on accessor/enum names that may drift across depthai-nodes releases:
-- Pose message accessor and angle order
-- GatherData field names (`.gathered` / `.reference` / `.data`)
-- Tracklet `.roi` accessor
+`# VERIFY` comments flag accessor/enum names that may drift across depthai-nodes
+releases — they print `[VERIFY]` warnings on the first real-hardware run:
+- Pose message accessor + angle order (`extract_pose`)
+- GatherData field names (`reference_data` / `detections` / `items`)
+- Tracklet `.roi` accessor; tracker type / id-policy enums
 
 ## Docs
 - Luxonis docs index: https://docs.luxonis.com/llms.txt
 - v3 SDK overview: https://docs.luxonis.com/software-v3/depthai.md
 - All nodes: https://docs.luxonis.com/software-v3/depthai/depthai-components/nodes.md
 - Model Zoo: https://docs.luxonis.com/software-v3/ai-inference/model-source/zoo.md
-- HubAI (model conversion): https://docs.luxonis.com/cloud/hubai.md
-- v2→v3 porting guide: https://docs.luxonis.com/software-v3/depthai/tutorials/v2-vs-v3.md

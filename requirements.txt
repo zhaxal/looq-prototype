@@ -2,7 +2,7 @@
 depthai>=3.0.0
 depthai-nodes>=0.2.0
 
-# Use the headless build on the Raspberry Pi (no GUI deps).
-# On your laptop (for --preview) swap this for plain opencv-python.
+# Headless OpenCV (no GUI deps) — the touch GUI uses Tkinter + Pillow instead.
 opencv-python-headless>=4.9.0
 numpy>=1.24.0
+Pillow>=10.0.0

@@ -1,4 +1,4 @@
-"""Per-track state, geometry helpers, and NN output parsers."""
+"""Per-track state, geometry helpers, and head-pose parsing."""
 from __future__ import annotations
 
 from . import config
@@ -40,8 +40,15 @@ def iou(a: tuple, b: tuple) -> float:
     return inter / (area_a + area_b - inter)
 
 
-def is_looking(yaw: float, pitch: float) -> bool:
-    return abs(yaw) < config.YAW_LIMIT and abs(pitch) < config.PITCH_LIMIT
+def is_looking_at_ad(yaw: float, pitch: float, settings: config.Settings) -> bool:
+    """True when the head pose points at the ad, not the camera.
+
+    The camera sits beside the ad, so a viewer looking at the ad has their head
+    turned by ~settings.yaw_offset. We test the pose against that offset instead of
+    against zero (which would mean "looking straight at the camera/operator").
+    """
+    return (abs(yaw   - settings.yaw_offset)   < settings.yaw_tol and
+            abs(pitch - settings.pitch_offset) < settings.pitch_tol)
 
 
 def tracklet_bbox(t) -> tuple:
@@ -51,7 +58,6 @@ def tracklet_bbox(t) -> tuple:
 def tracklet_too_small(t) -> bool:
     """True when the tracklet bbox area is below MIN_FACE_AREA (normalized)."""
     return t.roi.width * t.roi.height < config.MIN_FACE_AREA
-
 
 
 def best_match(query: tuple, candidates: list[tuple[int, tuple]]) -> int:
@@ -79,7 +85,7 @@ def total_dwell(tid: int, now: float,
 
 def extract_pose(msg) -> tuple[float, float, float]:
     """(yaw, pitch, roll) from a 3-head MessageGroup.
-    Keys "0","1","2" → yaw/pitch/roll. # VERIFY key ordering on first device run.
+    Keys "0","1","2" -> yaw/pitch/roll. # VERIFY key ordering on first device run.
     """
     try:
         return (float(msg["0"].prediction),
@@ -92,34 +98,11 @@ def extract_pose(msg) -> tuple[float, float, float]:
         ) from e
 
 
-def extract_age_gender(msg) -> tuple[str, int]:
-    """(gender_str, age_int) from age_gender-62x62.
-    Head "0" → age regression [0, 1] × 100 = years; head "1" → gender classification.
-    """
-    try:
-        age    = round(float(msg["0"].prediction) * 100)
-        gender = str(msg["1"].classes[0])
-        return gender, age
-    except (KeyError, AttributeError, IndexError) as e:
-        raise RuntimeError(
-            f"Age/gender parse failed; keys="
-            f"{list(msg.keys()) if hasattr(msg, 'keys') else dir(msg)}"
-        ) from e
-
-
-def extract_emotion(msg) -> tuple[str, float]:
-    """(label, confidence) from enet_b2_8_best Classifications (single-head model)."""
-    try:
-        return str(msg.classes[0]), float(msg.scores[0])
-    except (AttributeError, IndexError) as e:
-        raise RuntimeError(f"Emotion parse failed; attrs={dir(msg)}") from e
-
-
 def parse_gathered(msg) -> list[tuple[tuple, object]]:
     """[(det_bbox, payload), ...] from a GatheredData message.
 
-    Returns [] on empty frames — GatherData can emit a message with no items or
-    a None reference_data when no faces are present, which would raise AttributeError
+    Returns [] on empty frames — GatherData can emit a message with no items or a
+    None reference_data when no faces are present, which would raise AttributeError
     if read blindly.
     """
     ref   = getattr(msg, "reference_data", None)
