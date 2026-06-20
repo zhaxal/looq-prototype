@@ -7,7 +7,7 @@ import depthai as dai
 from depthai_nodes.node import FrameCropper, GatherData, ParsingNeuralNetwork
 
 from . import config
-from .processing import is_looking
+from .calc import is_looking
 
 
 # --- Model resolution --------------------------------------------------------

@@ -1,3 +1,6 @@
+# Legacy all-on-device app (main.py). For the Pi/server split see
+# requirements-pi.txt (streamer) and server/requirements.txt (GPU server).
+#
 # DepthAI v3 + host-side parser nodes. Pin majors; let patches float.
 depthai>=3.0.0
 depthai-nodes>=0.2.0

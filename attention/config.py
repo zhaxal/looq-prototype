@@ -53,6 +53,24 @@ AGE_GENDER_INTERVAL = 2.0
 # Minimum seconds between per-track emotion updates (heavy net on Pi 4 budget).
 EMOTION_INTERVAL = 2.0
 
+# --- Networking (Pi streamer → GPU server) -----------------------------------
+
+# WebSocket endpoint on the server that ingests the Pi's H.264 stream.
+LOOQ_SERVER_URL = os.environ.get("LOOQ_SERVER_URL", "ws://localhost:8000/ingest")
+# Bind host/port for the server (uvicorn).
+LOOQ_SERVER_HOST = os.environ.get("LOOQ_SERVER_HOST", "0.0.0.0")
+LOOQ_SERVER_PORT = int(os.environ.get("LOOQ_SERVER_PORT", "8000"))
+# Max encoded frames buffered on the Pi before dropping oldest (resilience).
+LOOQ_SEND_QUEUE_MAX = int(os.environ.get("LOOQ_SEND_QUEUE_MAX", "30"))
+
+# Directory holding the host-runnable ONNX models used by the server.
+ONNX_MODELS_DIR = Path(os.environ.get("ONNX_MODELS_DIR", str(MODELS_DIR / "onnx")))
+
+# H.264 encoder settings on the OAK (Pi side).
+ENCODER_BITRATE_KBPS = int(os.environ.get("ENCODER_BITRATE_KBPS", "4000"))
+ENCODER_KEYFRAME_FREQ = int(os.environ.get("ENCODER_KEYFRAME_FREQ", "15"))
+
+
 # --- Labels ------------------------------------------------------------------
 
 EMOTION_CLASSES = ["Anger", "Contempt", "Disgust", "Fear",
