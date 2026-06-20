@@ -44,33 +44,68 @@ class AdAttentionGUI:
     # --- Layout --------------------------------------------------------------
 
     def _build_widgets(self) -> None:
-        big   = tkfont.Font(family="DejaVu Sans", size=22, weight="bold")
-        huge  = tkfont.Font(family="DejaVu Sans", size=40, weight="bold")
-        label = tkfont.Font(family="DejaVu Sans", size=13)
-        btn   = tkfont.Font(family="DejaVu Sans", size=18, weight="bold")
+        big   = tkfont.Font(family="DejaVu Sans", size=13, weight="bold")
+        huge  = tkfont.Font(family="DejaVu Sans", size=24, weight="bold")
+        label = tkfont.Font(family="DejaVu Sans", size=10)
+        btn   = tkfont.Font(family="DejaVu Sans", size=12, weight="bold")
 
-        # Header
+        # Header — packed first so it's always at top
         header = tk.Frame(self.root, bg=BG)
-        header.pack(fill="x", padx=16, pady=(12, 4))
+        header.pack(side="top", fill="x", padx=8, pady=(4, 2))
         tk.Label(header, text="AD ATTENTION", font=big, fg=TEXT, bg=BG).pack(side="left")
         self.fps_lbl = tk.Label(header, text="", font=label, fg=MUTED, bg=BG)
         self.fps_lbl.pack(side="right")
 
-        # Body: preview (left) + stats (right)
+        # Controls + status — packed at bottom BEFORE the body so they are
+        # always reserved and never pushed off-screen when the preview fills.
+        controls = tk.Frame(self.root, bg=BG)
+        controls.pack(side="bottom", fill="x", padx=8, pady=(2, 6))
+
+        def make_btn(parent, text, color, cmd, width=6):
+            b = tk.Button(parent, text=text, font=btn, fg="#0b0f12", bg=color,
+                          activebackground=color, relief="flat", width=width,
+                          height=1, command=cmd, takefocus=0)
+            b.pack(side="left", padx=3)
+            return b
+
+        self.start_btn = make_btn(controls, "START",     GREEN, self._start)
+        self.stop_btn  = make_btn(controls, "STOP",      RED,   self._stop)
+        make_btn(controls, "CALIBRATE", AMBER, self._calibrate, width=9)
+
+        # Yaw offset nudger
+        off = tk.Frame(controls, bg=PANEL)
+        off.pack(side="left", padx=10)
+        tk.Label(off, text="YAW", font=label, fg=MUTED, bg=PANEL).grid(
+            row=0, column=0, columnspan=3, pady=(2, 0))
+        tk.Button(off, text="−", font=btn, fg=TEXT, bg=PANEL, relief="flat",
+                  width=2, command=lambda: self._nudge(-2), takefocus=0).grid(row=1, column=0, padx=3, pady=2)
+        self.offset_lbl = tk.Label(off, text="0°", font=btn, fg=TEXT, bg=PANEL, width=4)
+        self.offset_lbl.grid(row=1, column=1)
+        tk.Button(off, text="+", font=btn, fg=TEXT, bg=PANEL, relief="flat",
+                  width=2, command=lambda: self._nudge(+2), takefocus=0).grid(row=1, column=2, padx=3, pady=2)
+
+        make_btn(controls, "RESET", BLUE,      self._reset, width=6)
+        make_btn(controls, "QUIT",  "#5a6573", self._quit,  width=5)
+
+        self.status = tk.Label(self.root, text="Tap START to begin", font=label,
+                               fg=MUTED, bg=BG, anchor="w")
+        self.status.pack(side="bottom", fill="x", padx=8, pady=(0, 2))
+
+        # Body: preview (left) + stats (right) — packed last, takes remaining space
         body = tk.Frame(self.root, bg=BG)
-        body.pack(fill="both", expand=True, padx=16, pady=4)
+        body.pack(side="top", fill="both", expand=True, padx=8, pady=2)
 
         self.preview = tk.Label(body, bg="#000000")
         self.preview.pack(side="left", fill="both", expand=True)
 
         stats = tk.Frame(body, bg=PANEL)
-        stats.pack(side="right", fill="y", padx=(16, 0))
+        stats.pack(side="right", fill="y", padx=(8, 0))
 
         def stat(title: str, color: str) -> tk.Label:
             tk.Label(stats, text=title, font=label, fg=MUTED, bg=PANEL).pack(
-                anchor="w", padx=24, pady=(18, 0))
+                anchor="w", padx=12, pady=(10, 0))
             v = tk.Label(stats, text="0", font=huge, fg=color, bg=PANEL)
-            v.pack(anchor="w", padx=24)
+            v.pack(anchor="w", padx=12)
             return v
 
         self.looking_val = stat("LOOKING NOW", GREEN)
@@ -79,41 +114,6 @@ class AdAttentionGUI:
 
         # Calibration overlay (hidden unless calibrating)
         self.overlay = tk.Label(self.preview, text="", font=huge, fg=AMBER, bg="#000000")
-
-        # Status line
-        self.status = tk.Label(self.root, text="Tap START to begin", font=label,
-                               fg=MUTED, bg=BG, anchor="w")
-        self.status.pack(fill="x", padx=16, pady=(0, 4))
-
-        # Controls
-        controls = tk.Frame(self.root, bg=BG)
-        controls.pack(fill="x", padx=16, pady=(4, 16))
-
-        def make_btn(parent, text, color, cmd, width=8):
-            b = tk.Button(parent, text=text, font=btn, fg="#0b0f12", bg=color,
-                          activebackground=color, relief="flat", width=width,
-                          height=2, command=cmd, takefocus=0)
-            b.pack(side="left", padx=6)
-            return b
-
-        self.start_btn = make_btn(controls, "START", GREEN, self._start)
-        self.stop_btn  = make_btn(controls, "STOP",  RED,   self._stop)
-        make_btn(controls, "CALIBRATE", AMBER, self._calibrate, width=11)
-
-        # Yaw offset nudger
-        off = tk.Frame(controls, bg=PANEL)
-        off.pack(side="left", padx=18)
-        tk.Label(off, text="YAW OFFSET", font=label, fg=MUTED, bg=PANEL).grid(
-            row=0, column=0, columnspan=3, padx=10, pady=(6, 0))
-        tk.Button(off, text="−", font=btn, fg=TEXT, bg=PANEL, relief="flat",
-                  width=2, command=lambda: self._nudge(-2), takefocus=0).grid(row=1, column=0, padx=6, pady=6)
-        self.offset_lbl = tk.Label(off, text="0°", font=btn, fg=TEXT, bg=PANEL, width=5)
-        self.offset_lbl.grid(row=1, column=1)
-        tk.Button(off, text="+", font=btn, fg=TEXT, bg=PANEL, relief="flat",
-                  width=2, command=lambda: self._nudge(+2), takefocus=0).grid(row=1, column=2, padx=6, pady=6)
-
-        make_btn(controls, "RESET", BLUE, self._reset, width=7)
-        make_btn(controls, "QUIT", "#5a6573", self._quit, width=6)
 
     # --- Button handlers -----------------------------------------------------
 
