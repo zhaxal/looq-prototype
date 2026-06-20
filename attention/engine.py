@@ -113,35 +113,25 @@ class Engine:
 
     # --- Worker thread -------------------------------------------------------
 
+    # If no tracklet arrives for this many seconds while the pipeline claims to
+    # be running, treat it as a silent disconnect and force a reconnect.
+    _STALE_TIMEOUT = 5.0
+    # Reconnect backoff: starts at this value, doubles each failure, caps at max.
+    _RECONNECT_MIN = 3.0
+    _RECONNECT_MAX = 30.0
+
     def _publish(self, **changes) -> None:
         with self._lock:
             self._shared = replace(self._shared, **changes)
 
     def _run(self) -> None:
         verify_enums(dai)
-        try:
-            self._loop()
-        except Exception as exc:
-            import traceback
-            traceback.print_exc()
-            self._publish(running=False, error=True, message=f"Error: {exc}")
 
-    def _loop(self) -> None:
-        # Per-track session state.
-        track_states: dict[int, LookState]           = {}
-        pose_cache:   dict[int, tuple[float, float]] = {}
-        looking_ids:  set[int]                       = set()
-        look_accum:   dict[int, float]               = {}
-        look_since:   dict[int, float]               = {}
-
+        # Session-level state lives here so it survives camera reconnects.
         session_ids:   set[int]         = set()
         session_dwell: dict[int, float] = {}
         peak_looking   = 0
         session_start  = time.time()
-
-        # Calibration sample buffer.
-        calib_until    = 0.0
-        calib_samples: list[tuple[float, float]] = []
 
         csv_file = csv_writer = None
         if self.settings.log:
@@ -154,6 +144,84 @@ class Engine:
             csv_writer.writeheader()
             print(f"[log] writing to {log_path}")
 
+        reconnect_delay = 0.0
+
+        while not self._stop.is_set():
+            # Handle reset request between reconnect attempts too.
+            if self._reset.is_set():
+                self._reset.clear()
+                session_ids   = set()
+                session_dwell = {}
+                peak_looking  = 0
+                session_start = time.time()
+
+            if reconnect_delay > 0:
+                # Wait in small slices so we can respond to stop/reset.
+                deadline = time.time() + reconnect_delay
+                while time.time() < deadline and not self._stop.is_set():
+                    remaining = deadline - time.time()
+                    self._publish(
+                        running=False, error=True,
+                        message=f"Camera disconnected — reconnecting in {remaining:.0f}s…",
+                    )
+                    time.sleep(0.5)
+                if self._stop.is_set():
+                    break
+
+            self._publish(running=False, error=False, message="Connecting…")
+
+            try:
+                peak_looking = self._one_session(
+                    session_ids, session_dwell, peak_looking,
+                    session_start, csv_writer,
+                )
+                # Clean exit (stop requested): leave the retry loop.
+                if self._stop.is_set():
+                    break
+                # Pipeline ended on its own without an exception — unexpected;
+                # treat it like a disconnect and retry.
+                reconnect_delay = self._RECONNECT_MIN
+
+            except Exception as exc:
+                import traceback
+                traceback.print_exc()
+                print(f"[engine] error: {exc}")
+                reconnect_delay = min(
+                    max(reconnect_delay * 2, self._RECONNECT_MIN),
+                    self._RECONNECT_MAX,
+                )
+
+        # Flush any faces still active at the moment we stopped.
+        end = time.time()
+        summary = self._summary(session_ids, session_dwell, peak_looking,
+                                 end - session_start)
+        print("\n" + summary)
+        self._publish(running=False, error=False, message=summary)
+        if csv_file:
+            csv_file.close()
+
+    def _one_session(
+        self,
+        session_ids:   set,
+        session_dwell: dict,
+        peak_looking:  int,
+        session_start: float,
+        csv_writer,
+    ) -> int:
+        """Run the pipeline until stop is requested, a disconnect occurs, or a
+        stale-data timeout fires.  Returns updated peak_looking.
+        Raises on any DepthAI / pipeline error so the caller can reconnect.
+        """
+        # Per-pipeline-session state (resets on every reconnect).
+        track_states: dict[int, LookState]           = {}
+        pose_cache:   dict[int, tuple[float, float]] = {}
+        looking_ids:  set[int]                       = set()
+        look_accum:   dict[int, float]               = {}
+        look_since:   dict[int, float]               = {}
+
+        calib_until    = 0.0
+        calib_samples: list[tuple[float, float]] = []
+
         def purge(tid: int, now: float) -> None:
             session_ids.add(tid)
             session_dwell[tid] = (session_dwell.get(tid, 0.0)
@@ -164,14 +232,14 @@ class Engine:
             look_accum.pop(tid, None)
             look_since.pop(tid, None)
 
-        self._publish(running=True, error=False, message="")
-
         with dai.Pipeline() as pipeline:
             queues = att_pipeline.build(pipeline, self.settings)
             pipeline.start()
             print("[camera] pipeline started")
+            self._publish(running=True, error=False, message="")
 
             last_tick        = 0.0
+            last_data        = time.time()   # watchdog: time of last received tracklet
             frame_count      = 0
             fps_actual       = 0.0
             latest_frame     = None
@@ -183,25 +251,27 @@ class Engine:
                     self._reset.clear()
                     session_ids.clear(); session_dwell.clear()
                     peak_looking  = 0
-                    session_start = time.time()
 
-                # Start a calibration window on request.
                 if self._calib_secs is not None:
                     calib_until   = time.time() + self._calib_secs
                     calib_samples = []
                     self._calib_secs = None
 
-                # Always keep the freshest frame for the preview.
                 frame_msg = queues["frame"].tryGet()
                 if frame_msg is not None:
                     latest_frame = frame_msg.getCvFrame()
 
                 track_msg = queues["tracklets"].tryGet()
                 if track_msg is None:
+                    # Watchdog: no data for too long → force a reconnect.
+                    if time.time() - last_data > self._STALE_TIMEOUT:
+                        print("[engine] stale — no data; forcing reconnect")
+                        raise RuntimeError("Stale pipeline — no tracklet data")
                     time.sleep(0.005)
                     continue
 
-                # --- Pose ---
+                last_data = time.time()   # data arrived; reset watchdog
+
                 raw_poses: list[tuple[tuple, float, float]] = []
                 pose_msg = queues["poses"].tryGet()
                 if pose_msg is not None:
@@ -259,7 +329,7 @@ class Engine:
                 peak_looking = max(peak_looking, len(looking_ids))
                 frame_count += 1
 
-                # --- Calibration sampling: largest active face ---
+                # Calibration sampling: use the largest active face.
                 if now < calib_until:
                     big_tid, big_area = None, 0.0
                     for t in track_msg.tracklets:
@@ -270,7 +340,7 @@ class Engine:
                     if big_tid is not None and big_tid in pose_cache:
                         calib_samples.append(pose_cache[big_tid])
                 elif calib_samples and calib_until:
-                    yaws   = statistics.median(s[0] for s in calib_samples)
+                    yaws    = statistics.median(s[0] for s in calib_samples)
                     pitches = statistics.median(s[1] for s in calib_samples)
                     self.set_offsets(yaws, pitches)
                     msg = f"Calibrated: yaw {yaws:+.0f}°, pitch {pitches:+.0f}°"
@@ -278,7 +348,6 @@ class Engine:
                     self._publish(message=msg)
                     calib_samples, calib_until = [], 0.0
 
-                # --- Annotated frame + stats, throttled to ~0.1s ---
                 if latest_frame is not None and now - last_tick >= 0.1:
                     if last_tick:
                         fps_actual = frame_count / (now - last_tick)
@@ -320,20 +389,17 @@ class Engine:
                                                 len(looking_ids), len(active_ids))
                     last_tick = now
 
+            # Tell the GUI immediately — pipeline.stop() can take a few seconds.
+            self._publish(running=False, looking_now=0, tracked_now=0,
+                          tracks=[], frame=None, message="Stopping…")
             pipeline.stop()
 
-        # Flush faces still active at exit, then summarize.
+        # Flush per-session faces into the session accumulators.
         end = time.time()
         for tid in list(track_states):
-            session_ids.add(tid)
-            session_dwell[tid] = (session_dwell.get(tid, 0.0)
-                                  + total_dwell(tid, end, look_accum, look_since))
-        summary = self._summary(session_ids, session_dwell, peak_looking,
-                                 end - session_start)
-        print("\n" + summary)
-        self._publish(running=False, message=summary)
-        if csv_file:
-            csv_file.close()
+            purge(tid, end)
+
+        return peak_looking
 
     # --- Helpers -------------------------------------------------------------
 

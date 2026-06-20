@@ -121,7 +121,11 @@ class AdAttentionGUI:
 
     # --- Button handlers -----------------------------------------------------
 
-    def _start(self)     -> None: self.engine.start()
+    def _start(self) -> None:
+        # If a previous stop is still cleaning up, wait for the thread to finish
+        # before starting a new one (engine.start() checks this internally).
+        self.engine.start()
+
     def _stop(self)      -> None: self.engine.request_stop()   # non-blocking; UI stays live
     def _calibrate(self) -> None: self.engine.calibrate(5.0)
     def _reset(self)     -> None: self.engine.reset_session()
