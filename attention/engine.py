@@ -77,11 +77,16 @@ class Engine:
         self._thread = threading.Thread(target=self._run, name="engine", daemon=True)
         self._thread.start()
 
+    def request_stop(self) -> None:
+        """Signal the worker to stop; returns immediately (non-blocking)."""
+        self._stop.set()
+
     def stop(self) -> None:
+        """Signal the worker to stop and wait for it to finish (blocking)."""
         self._stop.set()
         t = self._thread
         if t and t.is_alive():
-            t.join(timeout=5.0)
+            t.join(timeout=6.0)
         self._thread = None
 
     def reset_session(self) -> None:

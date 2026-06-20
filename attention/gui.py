@@ -37,9 +37,13 @@ class AdAttentionGUI:
         self.root.configure(bg=BG)
         self.root.attributes("-fullscreen", True)
         self.root.bind("<Escape>", lambda _e: self._quit())
+        self.root.protocol("WM_DELETE_WINDOW", self._quit)
+
+        self._tick_id: str | None = None   # after() handle so we can cancel it
+        self._quitting = False
 
         self._build_widgets()
-        self.root.after(50, self._tick)
+        self._tick_id = self.root.after(50, self._tick)
 
     # --- Layout --------------------------------------------------------------
 
@@ -118,7 +122,7 @@ class AdAttentionGUI:
     # --- Button handlers -----------------------------------------------------
 
     def _start(self)     -> None: self.engine.start()
-    def _stop(self)      -> None: self.engine.stop()
+    def _stop(self)      -> None: self.engine.request_stop()   # non-blocking; UI stays live
     def _calibrate(self) -> None: self.engine.calibrate(5.0)
     def _reset(self)     -> None: self.engine.reset_session()
 
@@ -127,12 +131,21 @@ class AdAttentionGUI:
         self.offset_lbl.config(text=f"{self.settings.yaw_offset:+.0f}°")
 
     def _quit(self) -> None:
-        self.engine.stop()
+        if self._quitting:
+            return
+        self._quitting = True
+        # Cancel the pending _tick before touching the engine or destroying the window.
+        if self._tick_id:
+            self.root.after_cancel(self._tick_id)
+            self._tick_id = None
+        self.engine.stop()        # blocks until the worker thread finishes cleanly
         self.root.destroy()
 
     # --- Render loop ---------------------------------------------------------
 
     def _tick(self) -> None:
+        if self._quitting:
+            return
         s = self.engine.snapshot()
 
         self.looking_val.config(text=str(s.looking_now))
@@ -156,7 +169,7 @@ class AdAttentionGUI:
         else:
             self.overlay.place_forget()
 
-        self.root.after(33, self._tick)
+        self._tick_id = self.root.after(33, self._tick)
 
     def _show_frame(self, bgr) -> None:
         w = self.preview.winfo_width()  or 640
