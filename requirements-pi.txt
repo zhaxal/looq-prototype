@@ -5,5 +5,9 @@ depthai>=3.0.0
 # WebSocket client for the resilient frame sender (attention/netclient.py).
 websocket-client>=1.7.0
 
+# GUI deps (pi_gui.py / attention/streamer_gui.py).
+# python3-tk must also be installed via apt (see scripts/setup_pi.sh).
+Pillow>=10.0.0
+
 # depthai-nodes / opencv / numpy are only needed for the legacy on-device path
 # (main.py). The pure streamer does not import them.
