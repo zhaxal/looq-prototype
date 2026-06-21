@@ -1,0 +1,20 @@
+{
+  "calibration_id": "metro_billboard_001",
+  "created_at": "2026-06-22T08:00:00+00:00",
+  "camera_id": "oak_d_lite_01",
+  "camera_height_m": 1.5,
+  "billboard_id": "metro_billboard_001",
+  "billboard_width_m": 1.0,
+  "billboard_height_m": 3.0,
+  "method": "single_subject_5s_head_pose_billboard_direction",
+  "target": "center",
+  "yaw_mean_deg": 8.0,
+  "pitch_mean_deg": -5.0,
+  "yaw_std_deg": 4.0,
+  "pitch_std_deg": 3.0,
+  "sample_count": 48,
+  "valid_duration_sec": 4.8,
+  "yaw_tolerance_deg": 20.0,
+  "pitch_tolerance_deg": 15.0,
+  "notes": "EXAMPLE ONLY — placeholder values for offline tests. Recalibrate on-site for the real billboard/camera placement."
+}

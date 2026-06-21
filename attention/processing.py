@@ -51,6 +51,47 @@ def is_looking_at_ad(yaw: float, pitch: float, settings: config.Settings) -> boo
             abs(pitch - settings.pitch_offset) < settings.pitch_tol)
 
 
+def is_track_inside_roi(track_bbox: tuple, roi: tuple | None) -> bool:
+    """True if the track's bbox CENTER is inside the counting ROI.
+
+    Both are normalized (0..1) (xmin, ymin, xmax, ymax). A None ROI means
+    "whole frame" → always True. Used to ignore background faces in busy metro
+    scenes so only people in the billboard exposure zone are counted.
+    """
+    if roi is None:
+        return True
+    cx = (track_bbox[0] + track_bbox[2]) / 2.0
+    cy = (track_bbox[1] + track_bbox[3]) / 2.0
+    x1, y1, x2, y2 = roi
+    return x1 <= cx <= x2 and y1 <= cy <= y2
+
+
+def parse_roi(text: str | None) -> tuple | None:
+    """Parse '--counting-roi x1,y1,x2,y2' into a normalized (x1,y1,x2,y2) tuple.
+
+    Returns None for empty input. Raises ValueError on malformed/out-of-range
+    input so the CLI can report it clearly. Coordinates are clamped-checked to
+    [0,1] and normalized so x1<x2, y1<y2.
+    """
+    if not text:
+        return None
+    parts = [p.strip() for p in text.replace(" ", "").split(",")]
+    if len(parts) != 4:
+        raise ValueError("ROI must be 'x1,y1,x2,y2' (4 numbers in 0..1)")
+    try:
+        x1, y1, x2, y2 = (float(p) for p in parts)
+    except ValueError as e:
+        raise ValueError(f"ROI values must be numbers: {e}") from e
+    vals = (x1, y1, x2, y2)
+    if any(v < 0.0 or v > 1.0 for v in vals):
+        raise ValueError("ROI coordinates must be between 0.0 and 1.0")
+    x1, x2 = sorted((x1, x2))
+    y1, y2 = sorted((y1, y2))
+    if x2 - x1 < 0.01 or y2 - y1 < 0.01:
+        raise ValueError("ROI is too small / degenerate")
+    return (x1, y1, x2, y2)
+
+
 def tracklet_bbox(t) -> tuple:
     return (t.roi.x, t.roi.y, t.roi.x + t.roi.width, t.roi.y + t.roi.height)  # VERIFY .roi
 

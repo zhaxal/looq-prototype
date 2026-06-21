@@ -17,6 +17,13 @@ venv/
 # Session logs
 attention_*.csv
 
+# Field session outputs + debug bundles (summaries/events/zips are per-run)
+runs/
+
+# On-site calibration profiles (placement-specific; example is committed)
+configs/*_calibration.json
+!configs/example_calibration.json
+
 # Per-device user settings (offsets are calibrated on-site)
 settings.json
 

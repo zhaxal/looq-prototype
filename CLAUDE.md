@@ -38,19 +38,49 @@ Camera(BGR888p 320x240) → PNN[YuNet] → ObjectTracker(SHORT_TERM_IMAGELESS+UN
 ## Project Layout
 ```
 app.py                  touch-GUI entry point  →  python app.py
-main.py                 headless/SSH CLI (--calibrate, --log, offset flags)
+main.py                 field/headless CLI: --doctor, --simulate-poses, --privacy-safe,
+                        --calibrate center, field run + TUI, summary.json + events.csv
 attention/
   config.py             constants + Settings (settings.json) + load_dotenv()
   processing.py         LookState, geometry, is_looking_at_ad(), pose parser, VERIFY probes
   pipeline.py           DepthAI v3 pipeline (single head-pose branch)
-  engine.py             worker thread, host loop, SharedState, calibrate, CSV log
+  engine.py             worker thread, host loop, SharedState (incl. dwell buckets), CSV/events
   gui.py                Tkinter fullscreen touch UI
+  metrics.py            pure dwell-bucket counting (total_passed/looked_0_3/0_5/1_0) — testable
+  calibration.py        Calibration JSON profile (billboard direction) load/save/validate
+  report.py             summary.json schema builder (privacy block + limitations)
+  privacy.py            assert_privacy_safe() — reject --age-gender/--emotion/--upload/…
+  doctor.py             --doctor checks (software/hardware/privacy/calibration/output)
+  simulate.py           --simulate-poses offline counter verification (no hardware)
+  field_wizard.py       `main.py field <doctor|preview|calibrate|controlled|middle|high|bundle>`
 scripts/
   setup_pi.sh           one-shot Pi provisioning
   download_models.py    fetch YuNet + head-pose from the zoo (models restored from git otherwise)
+  collect_debug_bundle.py  privacy-safe runs/debug_bundle_*.zip (text/JSON only, no images)
+  field_wizard.py       thin wrapper → same as `python main.py field <phase>`
+configs/                calibration profiles (example_calibration.json committed)
+runs/                   per-session summary.json + events.csv (gitignored)
+docs/FIELD_GUIDE.md     single operator guide (setup, steps, results, privacy, troubleshooting)
 run.sh, adwatch.desktop tap-to-launch on the Pi desktop
 models/                 yunet-{320x240,640x480} + head-pose-60x60 archives
 ```
+
+## Field MVP (privacy-safe billboard counter)
+- Metric = **LIKELY_ATTENTION**: unique local face/head track whose head pose stayed
+  near the **calibrated billboard direction** for a dwell threshold. Not gaze/identity/
+  demographics. The looking decision is `is_looking_at_ad()` against `yaw_offset/pitch_offset`,
+  which the calibration file sets (camera sits *beside* the ad).
+- Reported numbers: `total_passed, looked_total, looked_0_3s, looked_0_5s, looked_1_0s`.
+  Bucket logic lives in `attention/metrics.py` and is verified offline by `--simulate-poses`.
+- Privacy by construction: no age/gender/emotion, no crops/frames/video saved, no upload.
+  `--privacy-safe` makes that strict (rejects unsafe flags). Runbook: `docs/`.
+- **Counting ROI** (`--counting-roi x1,y1,x2,y2`, normalized): `is_track_inside_roi()`
+  gates counting/dwell to the billboard exposure zone (background filter). Optional;
+  warns if absent. **Field phases** (`--test-phase`) + `report.compute_field_decision()`
+  produce `field_decision: pass|warning|fail|not_evaluated` for controlled sanity tests.
+- **Results persistence**: each phase writes `runs/<ts>_<phase>/` (summary.json, events.csv,
+  command.txt, README.txt, calibration.json copy); calibration also keeps a timestamped copy.
+  Billboard for this PoC is **1.0m × 2.0m**, camera height ~1.6m.
 
 ## Confirmed v3 Model Zoo Slugs
 - Face detect: `luxonis/yunet:<res>` (320x240 default; also 640x360/640x480/960x720)

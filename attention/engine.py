@@ -12,12 +12,13 @@ import threading
 import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+from pathlib import Path
 
 import cv2
 
-from . import config, pipeline as att_pipeline
+from . import config, metrics, pipeline as att_pipeline
 from .processing import (
-    LookState, is_looking_at_ad, extract_pose, parse_gathered,
+    LookState, is_looking_at_ad, is_track_inside_roi, extract_pose, parse_gathered,
     tracklet_bbox, tracklet_too_small, best_match, total_dwell,
     verify_enums, probe_tracklet, probe_gathered,
 )
@@ -54,6 +55,13 @@ class SharedState:
     calib_remaining: float = 0.0
     message:      str = ""               # transient status / calibrate result / error
     error:        bool = False
+    # --- Field metrics (dwell buckets) — the numbers reported tomorrow ---------
+    total_passed: int = 0                # unique valid tracks (>= MIN_TRACK_SECS)
+    looked_total: int = 0                # tracks with looking dwell >= 0.3s
+    looked_0_3:   int = 0
+    looked_0_5:   int = 0
+    looked_1_0:   int = 0
+    frame_seq:    int = 0                # increments on every publish (change detector)
 
 
 class Engine:
@@ -67,6 +75,14 @@ class Engine:
         self._stop    = threading.Event()
         self._reset   = threading.Event()
         self._calib_secs: float | None = None
+        self._pub_seq = 0
+        # Optional privacy-safe events.csv (set by the field runner before start()).
+        # Schema: timestamp,track_id,event,looking,dwell_sec,yaw_deg,pitch_deg,reason.
+        # No age/gender/emotion is ever written.
+        self.events_csv_path: str | None = None
+        # Optional counting ROI (normalized x1,y1,x2,y2). Tracks whose center is
+        # outside it are ignored entirely (not counted, no dwell). None = full frame.
+        self.counting_roi: tuple | None = None
 
     # --- Public controls (called from the GUI/main thread) -------------------
 
@@ -122,7 +138,8 @@ class Engine:
 
     def _publish(self, **changes) -> None:
         with self._lock:
-            self._shared = replace(self._shared, **changes)
+            self._pub_seq += 1
+            self._shared = replace(self._shared, frame_seq=self._pub_seq, **changes)
 
     def _run(self) -> None:
         verify_enums(dai)
@@ -130,6 +147,8 @@ class Engine:
         # Session-level state lives here so it survives camera reconnects.
         session_ids:   set[int]         = set()
         session_dwell: dict[int, float] = {}
+        # track_id -> [first_seen, last_seen]; used for the MIN_TRACK_SECS filter.
+        session_seen:  dict[int, list]  = {}
         peak_looking   = 0
         session_start  = time.time()
 
@@ -144,6 +163,19 @@ class Engine:
             csv_writer.writeheader()
             print(f"[log] writing to {log_path}")
 
+        # Optional privacy-safe events.csv (field mode). Anonymous columns only.
+        events_file = events_writer = None
+        if self.events_csv_path:
+            ep = Path(self.events_csv_path)
+            ep.parent.mkdir(parents=True, exist_ok=True)
+            events_file = open(ep, "w", newline="", buffering=1)
+            events_writer = csv.DictWriter(events_file, fieldnames=[
+                "timestamp", "track_id", "event", "looking",
+                "dwell_sec", "yaw_deg", "pitch_deg", "reason",
+            ])
+            events_writer.writeheader()
+            print(f"[events] writing to {ep}")
+
         reconnect_delay = 0.0
 
         while not self._stop.is_set():
@@ -152,6 +184,7 @@ class Engine:
                 self._reset.clear()
                 session_ids   = set()
                 session_dwell = {}
+                session_seen  = {}
                 peak_looking  = 0
                 session_start = time.time()
 
@@ -172,8 +205,8 @@ class Engine:
 
             try:
                 peak_looking = self._one_session(
-                    session_ids, session_dwell, peak_looking,
-                    session_start, csv_writer,
+                    session_ids, session_dwell, session_seen, peak_looking,
+                    session_start, csv_writer, events_writer,
                 )
                 # Clean exit (stop requested): leave the retry loop.
                 if self._stop.is_set():
@@ -196,17 +229,58 @@ class Engine:
         summary = self._summary(session_ids, session_dwell, peak_looking,
                                  end - session_start)
         print("\n" + summary)
-        self._publish(running=False, error=False, message=summary)
+        counts = self._bucket_counts(session_ids, session_dwell, session_seen)
+        self._publish(
+            running=False, error=False, message=summary,
+            total_passed=counts["total_passed"], looked_total=counts["looked_total"],
+            looked_0_3=counts["looked_0_3s"], looked_0_5=counts["looked_0_5s"],
+            looked_1_0=counts["looked_1_0s"],
+        )
         if csv_file:
             csv_file.close()
+        if events_file:
+            events_file.close()
+
+    # --- Field metrics helpers ----------------------------------------------
+
+    @staticmethod
+    def _bucket_counts(session_ids, session_dwell, session_seen,
+                       active=None) -> dict:
+        """Build TrackRecords from session (+ optional live active) data and count
+        the dwell buckets. `active` is an iterable of
+        (tid, first_seen, last_seen, looking_accum) for not-yet-purged tracks.
+        """
+        recs: dict[int, metrics.TrackRecord] = {}
+        for tid in session_ids:
+            first, last = session_seen.get(tid, (0.0, 0.0))
+            recs[tid] = metrics.TrackRecord(tid, first, last,
+                                            session_dwell.get(tid, 0.0))
+        for tid, first, last, accum in (active or ()):
+            recs[tid] = metrics.TrackRecord(tid, first, last, accum)
+        return metrics.count_buckets(recs.values())
+
+    @staticmethod
+    def _emit_event(writer, ts, tid, event, looking, dwell, yaw, pitch, reason) -> None:
+        writer.writerow({
+            "timestamp": datetime.now().isoformat(timespec="milliseconds"),
+            "track_id":  tid,
+            "event":     event,
+            "looking":   int(looking),
+            "dwell_sec": f"{dwell:.2f}",
+            "yaw_deg":   f"{yaw:.1f}"   if yaw   is not None else "",
+            "pitch_deg": f"{pitch:.1f}" if pitch is not None else "",
+            "reason":    reason,
+        })
 
     def _one_session(
         self,
         session_ids:   set,
         session_dwell: dict,
+        session_seen:  dict,
         peak_looking:  int,
         session_start: float,
         csv_writer,
+        events_writer=None,
     ) -> int:
         """Run the pipeline until stop is requested, a disconnect occurs, or a
         stale-data timeout fires.  Returns updated peak_looking.
@@ -222,10 +296,17 @@ class Engine:
         calib_until    = 0.0
         calib_samples: list[tuple[float, float]] = []
 
-        def purge(tid: int, now: float) -> None:
+        def purge(tid: int, now: float, reason: str = "track_lost") -> None:
             session_ids.add(tid)
             session_dwell[tid] = (session_dwell.get(tid, 0.0)
                                   + total_dwell(tid, now, look_accum, look_since))
+            if tid in session_seen:
+                session_seen[tid][1] = now
+            if events_writer is not None and tid in session_seen:
+                yaw, pitch = pose_cache.get(tid, (None, None))
+                self._emit_event(events_writer, now, tid, "exit",
+                                 tid in looking_ids, session_dwell[tid],
+                                 yaw, pitch, reason)
             track_states.pop(tid, None)
             pose_cache.pop(tid, None)
             looking_ids.discard(tid)
@@ -249,7 +330,7 @@ class Engine:
             while pipeline.isRunning() and not self._stop.is_set():
                 if self._reset.is_set():
                     self._reset.clear()
-                    session_ids.clear(); session_dwell.clear()
+                    session_ids.clear(); session_dwell.clear(); session_seen.clear()
                     peak_looking  = 0
 
                 if self._calib_secs is not None:
@@ -293,10 +374,17 @@ class Engine:
                             self._write_row(csv_writer, t.id, t.status.name.lower(),
                                             now, pose_cache, looking_ids, look_accum,
                                             look_since, len(looking_ids), len(active_ids))
-                        purge(t.id, now)
+                        purge(t.id, now, reason=t.status.name.lower())
                         continue
 
                     if tracklet_too_small(t):
+                        continue
+
+                    tb = tracklet_bbox(t)
+                    # Counting ROI: ignore background faces outside the zone. A
+                    # track outside the ROI is treated as not present, so it is
+                    # neither counted nor accumulates looking dwell while outside.
+                    if not is_track_inside_roi(tb, self.counting_roi):
                         continue
 
                     if not _tracklet_probed:
@@ -305,22 +393,42 @@ class Engine:
 
                     active_ids.add(t.id)
                     track_states.setdefault(t.id, LookState())
+                    # First sighting of this track id → record first_seen + "enter".
+                    if t.id not in session_seen:
+                        session_seen[t.id] = [now, now]
+                        if events_writer is not None:
+                            self._emit_event(events_writer, now, t.id, "enter",
+                                             False, 0.0, None, None, "track_started")
+                    else:
+                        session_seen[t.id][1] = now
 
-                    tb     = tracklet_bbox(t)
                     best_i = best_match(tb, pose_idx)
                     if best_i >= 0:
                         pose_cache[t.id] = (raw_poses[best_i][1], raw_poses[best_i][2])
 
                     yaw, pitch = pose_cache.get(t.id, config.POSE_UNSEEN)
                     looking = is_looking_at_ad(yaw, pitch, self.settings)
+                    was_looking = t.id in looking_ids
                     if track_states[t.id].update(looking, now):
                         looking_ids.add(t.id)
                         look_since.setdefault(t.id, now)
+                        if events_writer is not None and not was_looking:
+                            self._emit_event(events_writer, now, t.id, "look_start",
+                                             True, total_dwell(t.id, now, look_accum, look_since),
+                                             pose_cache.get(t.id, (None, None))[0],
+                                             pose_cache.get(t.id, (None, None))[1],
+                                             "pose_in_billboard_cone")
                     else:
                         looking_ids.discard(t.id)
                         if t.id in look_since:
                             look_accum[t.id] = (look_accum.get(t.id, 0.0)
                                                 + now - look_since.pop(t.id))
+                            if events_writer is not None and was_looking:
+                                self._emit_event(events_writer, now, t.id, "look_end",
+                                                 False, look_accum.get(t.id, 0.0),
+                                                 pose_cache.get(t.id, (None, None))[0],
+                                                 pose_cache.get(t.id, (None, None))[1],
+                                                 "pose_left_billboard_cone")
 
                 for tid in list(track_states):
                     if tid not in active_ids:
@@ -371,6 +479,15 @@ class Engine:
                                         *(pose_cache.get(tid, (None, None))))
                               for tid in sorted(active_ids)]
 
+                    # Live dwell-bucket counts: session totals + currently-active tracks.
+                    active_recs = [
+                        (tid, session_seen.get(tid, [now, now])[0],
+                         session_seen.get(tid, [now, now])[1], dwell_map.get(tid, 0.0))
+                        for tid in active_ids
+                    ]
+                    counts = self._bucket_counts(session_ids, session_dwell,
+                                                 session_seen, active_recs)
+
                     self._publish(
                         running=True, frame=annotated, fps=fps_actual,
                         looking_now=len(looking_ids), tracked_now=len(active_ids),
@@ -379,6 +496,9 @@ class Engine:
                         tracks=tracks,
                         calibrating=now < calib_until,
                         calib_remaining=max(0.0, calib_until - now),
+                        total_passed=counts["total_passed"], looked_total=counts["looked_total"],
+                        looked_0_3=counts["looked_0_3s"], looked_0_5=counts["looked_0_5s"],
+                        looked_1_0=counts["looked_1_0s"],
                     )
 
                     if csv_writer:
