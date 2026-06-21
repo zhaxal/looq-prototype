@@ -26,7 +26,7 @@ from pathlib import Path
 from attention.config import (
     load_dotenv,
     DEFAULT_FPS, FACE_RESOLUTIONS, AGE_GENDER_INTERVAL, EMOTION_INTERVAL,
-    YAW_LIMIT, PITCH_LIMIT, DEBOUNCE_SECS, POSE_UNSEEN,
+    YAW_LIMIT, PITCH_LIMIT, DEBOUNCE_SECS, POSE_UNSEEN, CAMERA_FLIPPED,
 )
 from attention import pipeline as att_pipeline
 from attention.display import LiveDisplay, draw_preview
@@ -67,6 +67,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--test-video",   type=Path, metavar="VIDEO",
                    help="replay a video file instead of the live camera "
                         "(demo / performance testing)")
+    p.add_argument("--no-flip",      dest="flip", action="store_false",
+                   help="camera is mounted right-side up; disable the default "
+                        "180° upside-down correction (live camera only)")
+    p.set_defaults(flip=CAMERA_FLIPPED)
     return p.parse_args()
 
 
@@ -372,7 +376,10 @@ def main() -> None:
     active = ["pose"]
     if args.age_gender: active.append("age/gender")
     if args.emotion:    active.append("emotion")
-    source = f"video:{args.test_video}" if args.test_video else "camera"
+    if args.test_video:
+        source = f"video:{args.test_video}"
+    else:
+        source = "camera" + (" (180° flip)" if args.flip else "")
 
     print(f"Branches: {', '.join(active)}  |  "
           f"face-res: {args.face_res}  fps: {args.fps}  source: {source}")
