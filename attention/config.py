@@ -39,6 +39,12 @@ EMOTION_INPUT    = (260, 260)
 
 FACE_RESOLUTIONS = ("320x240", "640x360", "640x480", "960x720")
 
+# Camera is mounted upside down on the rig: correct it with a 180° rotation at
+# the source so every downstream stage (detection, tracker, crops, pose, preview)
+# sees an upright frame. Applies to the live camera only — `--test-video` files
+# are already upright. Override at runtime with --no-flip.
+CAMERA_FLIPPED = True
+
 DEFAULT_FPS     = 12
 FACE_CONFIDENCE = 0.80
 MIN_FACE_AREA   = 0.003  # normalized bbox area; filters distant blobs (≈ 55×42 px at 640×480)

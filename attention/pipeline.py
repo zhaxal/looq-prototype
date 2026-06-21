@@ -129,11 +129,37 @@ def make_face_branch(pipeline, face_detections, face_image,
     return gathered.out.createOutputQueue(maxSize=2, blocking=False)  # VERIFY kwargs
 
 
+def flip_180(pipeline, src, cam_w: int, cam_h: int):
+    """Rotate a BGR888p frame 180° to correct for an upside-down camera mount.
+
+    Done once at the source so every downstream stage (face detection, tracker,
+    croppers, head pose, preview) sees an upright frame with no orientation-aware
+    logic. A 180° turn maps (x, y) → (w-x, h-y), so the cropper's normalized ROIs
+    stay valid and the head-pose yaw/pitch keep their usual sign convention.
+    """
+    manip = pipeline.create(dai.node.ImageManip)
+    try:
+        manip.initialConfig.addRotateDeg(180)          # VERIFY rotate API name on this depthai release
+    except AttributeError:
+        # Fallback: 180° == horizontal flip + vertical flip.
+        manip.initialConfig.addFlipHorizontal()        # VERIFY flip API names
+        manip.initialConfig.addFlipVertical()
+    manip.initialConfig.setFrameType(dai.ImgFrame.Type.BGR888p)
+    manip.setMaxOutputFrameSize(cam_w * cam_h * 3)
+    src.link(manip.inputImage)                          # VERIFY input/output names
+    return manip.out
+
+
 def make_input_source(pipeline, args, cam_w: int, cam_h: int):
     """Return a BGR888p ImgFrame output at (cam_w, cam_h): live camera or video replay."""
     if not getattr(args, "test_video", None):
         cam = pipeline.create(dai.node.Camera).build()
-        return cam.requestOutput((cam_w, cam_h), dai.ImgFrame.Type.BGR888p, fps=args.fps)
+        out = cam.requestOutput((cam_w, cam_h), dai.ImgFrame.Type.BGR888p, fps=args.fps)
+        # The upside-down mount affects the physical camera only; replay files are upright.
+        if getattr(args, "flip", config.CAMERA_FLIPPED):
+            out = flip_180(pipeline, out, cam_w, cam_h)
+            print("[camera] 180° flip enabled (upside-down mount)")
+        return out
 
     # Video replay: swap the camera for a file source; all VPU inference is unchanged.
     replay = pipeline.create(dai.node.ReplayVideo)    # VERIFY node name in v3
