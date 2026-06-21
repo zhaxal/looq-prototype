@@ -5,7 +5,10 @@ long. OAK-D-Lite + Raspberry Pi 4 with a **touchscreen**, operated entirely from
 fullscreen touch GUI (no terminal).
 
 ## Hardware & Deploy
-- Camera: OAK-D-Lite (RVC2 VPU), sitting **beside** the ad on a fixed side.
+- Camera: OAK-D-Lite (RVC2 VPU), sitting **beside** the ad on a fixed side,
+  mounted **upside down** — the sensor is rotated 180° on-device
+  (`Settings.flip_180` → `CameraImageOrientation.ROTATE_180_DEG`) so the whole
+  pipeline and preview see an upright image; pose signs match a normal mount.
 - Host: Raspberry Pi 4 with touchscreen (desktop session — the GUI is Tkinter).
 - Power: powered USB hub or Y-cable (Pi USB alone is unreliable).
 - Provision: `bash scripts/setup_pi.sh` (apt deps, OAK udev rule, venv, models, icon).
@@ -19,7 +22,8 @@ DepthAI **v3**. Do not use v2 patterns.
   camera axis. The **Calibrate** button measures that offset empirically (and resolves
   its sign) — see `Settings.yaw_offset` / `is_looking_at_ad()`.
 - Metrics only: **unique viewer count + dwell time**. No age/gender/emotion.
-- Settings persist to `settings.json` (offsets, tolerances, face_res, fps, log).
+- Settings persist to `settings.json` (offsets, tolerances, face_res, fps, log,
+  flip_180).
 
 ## Architecture
 GUI on the main thread; the DepthAI pipeline + host matching loop run in a worker

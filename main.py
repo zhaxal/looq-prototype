@@ -25,6 +25,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pitch-offset", type=float)
     p.add_argument("--yaw-tol",      type=float)
     p.add_argument("--pitch-tol",    type=float)
+    p.add_argument("--flip-180",     dest="flip_180", action=argparse.BooleanOptionalAction,
+                   default=None, help="rotate 180° for an upside-down camera mount "
+                                      "(--no-flip-180 to disable)")
     p.add_argument("--log",          action="store_true",
                    help="write an attention_*.csv session log")
     p.add_argument("--calibrate",    nargs="?", type=float, const=5.0, metavar="SECS",
@@ -34,7 +37,8 @@ def parse_args() -> argparse.Namespace:
 
 def build_settings(args: argparse.Namespace) -> config.Settings:
     s = config.Settings.load()
-    for field in ("face_res", "fps", "yaw_offset", "pitch_offset", "yaw_tol", "pitch_tol"):
+    for field in ("face_res", "fps", "yaw_offset", "pitch_offset",
+                  "yaw_tol", "pitch_tol", "flip_180"):
         val = getattr(args, field, None)
         if val is not None:
             setattr(s, field, val)

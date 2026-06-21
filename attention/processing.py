@@ -128,6 +128,7 @@ def verify_enums(dai) -> None:
         (dai.Tracklet.TrackingStatus, "REMOVED"),
         (dai.TrackerType,             "SHORT_TERM_IMAGELESS"),
         (dai.TrackerIdAssignmentPolicy, "UNIQUE_ID"),
+        (dai.CameraImageOrientation,  "ROTATE_180_DEG"),
     ]
     for obj, name in checks:
         if not hasattr(obj, name):

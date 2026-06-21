@@ -109,6 +109,10 @@ def build(pipeline, settings: config.Settings) -> dict:
     pose_model   = resolve_model(config.POSE_MODEL_SLUG, "head-pose-60x60.rvc2.tar.xz")
 
     cam     = pipeline.create(dai.node.Camera).build()
+    if settings.flip_180:
+        # Camera is mounted upside down; rotate on the sensor so every downstream
+        # node (face NN, tracker, head-pose, preview) gets an upright image.
+        cam.setImageOrientation(dai.CameraImageOrientation.ROTATE_180_DEG)  # VERIFY enum
     cam_out = cam.requestOutput((cam_w, cam_h), dai.ImgFrame.Type.BGR888p, fps=settings.fps)
 
     face_nn = pipeline.create(ParsingNeuralNetwork).build(

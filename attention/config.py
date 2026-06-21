@@ -66,6 +66,9 @@ class Settings:
     face_res:     str   = "320x240"   # YuNet input; 320x240 is the Pi-friendly default
     fps:          float = 12.0
     log:          bool  = False   # write an attention_*.csv session log
+    flip_180:     bool  = True    # camera is mounted upside down — rotate the sensor 180°
+                                  # so the whole pipeline (detect/track/pose/preview) sees
+                                  # an upright image and pose signs match a normal mount
 
     @classmethod
     def load(cls, path: Path = SETTINGS_FILE) -> "Settings":
