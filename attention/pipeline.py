@@ -37,6 +37,12 @@ def patch_frame_cropper() -> None:
         "cfg.addCropRotatedRect(rect=pad_rotated_rect(rot_rect, PADDING), normalizedCoords=True)",
         "cfg.addCropRotatedRect(pad_rotated_rect(rot_rect, PADDING), True)",
     )
+    # On-device lpb.ImageDetection has no getBoundingBox() — build RotatedRect from xmin/xmax/ymin/ymax.
+    # YuNet outputs axis-aligned boxes so angle=0 is correct.
+    tmpl = tmpl.replace(
+        "rot_rect = det.getBoundingBox()",
+        "rot_rect = RotatedRect(Point2f((det.xmin + det.xmax) / 2.0, (det.ymin + det.ymax) / 2.0), Size2f(det.xmax - det.xmin, det.ymax - det.ymin), 0)",
+    )
     tmpl = "\n".join(ln for ln in tmpl.split("\n") if "setTimestampDevice" not in ln)
     FrameCropper.IMG_DETECTIONS_SCRIPT_CONTENT = Template(tmpl)
 
