@@ -113,10 +113,16 @@ def build(pipeline, settings: config.Settings) -> dict:
 
     if settings.flip_180:
         # Camera is mounted upside down. dai.node.Camera (v3) has no
-        # setImageOrientation; rotate via ImageManip instead so every
-        # downstream node sees an upright image.
+        # setImageOrientation; rotate via ImageManip (setCropRotatedRect)
+        # so every downstream node sees an upright image.
         manip = pipeline.create(dai.node.ImageManip)
-        manip.initialConfig.setRotationDegrees(180)
+        rr = dai.RotatedRect()
+        rr.center.x = cam_w / 2
+        rr.center.y = cam_h / 2
+        rr.size.width = cam_w
+        rr.size.height = cam_h
+        rr.angle = 180
+        manip.initialConfig.setCropRotatedRect(rr, False)
         manip.setMaxOutputFrameSize(cam_w * cam_h * 3)
         cam_out.link(manip.inputImage)
         face_input = manip.out
