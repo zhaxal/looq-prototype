@@ -116,7 +116,7 @@ def build(pipeline, settings: config.Settings) -> dict:
         # setImageOrientation; rotate via ImageManip instead so every
         # downstream node sees an upright image.
         manip = pipeline.create(dai.node.ImageManip)
-        manip.initialConfig.setRotationDegrees(180)
+        manip.initialConfig.addRotateDeg(180)
         manip.setMaxOutputFrameSize(cam_w * cam_h * 3)
         cam_out.link(manip.inputImage)
         face_input = manip.out
