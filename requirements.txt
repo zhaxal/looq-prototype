@@ -1,6 +1,6 @@
 # DepthAI v3 + host-side parser nodes. Pin majors; let patches float.
-depthai==3.2.1
-depthai-nodes==0.3.7
+depthai>=3.0.0
+depthai-nodes>=0.2.0
 
 # Headless OpenCV (no GUI deps) — the touch GUI uses Tkinter + Pillow instead.
 opencv-python-headless>=4.9.0
